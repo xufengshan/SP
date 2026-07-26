@@ -233,30 +233,34 @@ def test_previous_mpc_failure_gets_one_stock_recovery_cycle():
   assert recovered_calls == [(({}, 15.0, True, ceiling), {"jerk_cost_multiplier": 1.0})]
 
 
-def test_routine_governor_restriction_forwards_the_jerk_cost_multiplier():
+@pytest.mark.parametrize(
+  "mpc_source",
+  (MpcLongitudinalPlanSource.cruise, MpcLongitudinalPlanSource.lead0, MpcLongitudinalPlanSource.lead1),
+)
+def test_routine_governor_restriction_forwards_the_jerk_cost_multiplier(mpc_source):
   planner, _ = planner_for_mpc_test(
     state=AccelControllerState.restrict, selected_lead=0, required_decel=0.30,
-    mpc_source=MpcLongitudinalPlanSource.cruise,
+    mpc_source=mpc_source,
   )
   _, calls = run_controller_mpc(planner)
 
   assert calls == [(({}, 15.0, True, None), {"jerk_cost_multiplier": MPC_DECEL_JERK_COST_MULTIPLIER})]
 
 
-def test_lead_source_blocks_smoothing_only_until_the_restriction_episode_ends():
+def test_ineligible_required_decel_blocks_smoothing_only_until_the_restriction_episode_ends():
   planner, _ = planner_for_mpc_test(
     state=AccelControllerState.restrict, selected_lead=0, required_decel=0.30,
-    mpc_source=MpcLongitudinalPlanSource.cruise,
   )
   _, initial_calls = run_controller_mpc(planner)
   routine_result = planner.accel_controller_result
   assert initial_calls[0][1] == {"jerk_cost_multiplier": MPC_DECEL_JERK_COST_MULTIPLIER}
 
-  planner.mpc.source = MpcLongitudinalPlanSource.lead0
-  _, lead_calls = run_controller_mpc(planner)
-  assert lead_calls[0][1] == {"jerk_cost_multiplier": 1.0}
+  ineligible_result = SimpleNamespace(**(vars(routine_result) | {"required_decel": MPC_DECEL_JERK_MAX_REQUIRED_DECEL}))
+  planner.update_accel_controller = lambda *_args, **_kwargs: setattr(planner, "accel_controller_result", ineligible_result)
+  _, ineligible_calls = run_controller_mpc(planner)
+  assert ineligible_calls[0][1] == {"jerk_cost_multiplier": 1.0}
 
-  planner.mpc.source = MpcLongitudinalPlanSource.cruise
+  planner.update_accel_controller = lambda *_args, **_kwargs: setattr(planner, "accel_controller_result", routine_result)
   _, flicker_calls = run_controller_mpc(planner)
   assert flicker_calls[0][1] == {"jerk_cost_multiplier": 1.0}
 
@@ -284,8 +288,6 @@ def test_lead_source_blocks_smoothing_only_until_the_restriction_episode_ends():
     (AccelControllerState.restrict, 0, False, 0.30, 20.0 - MPC_DECEL_JERK_MAX_TARGET_REDUCTION, MpcLongitudinalPlanSource.cruise),
     (AccelControllerState.restrict, 0, False, 0.30, 20.0, MpcLongitudinalPlanSource.cruise),
     (AccelControllerState.restrict, 0, False, 0.30, 25.0, MpcLongitudinalPlanSource.cruise),
-    (AccelControllerState.restrict, 0, False, 0.30, 15.0, MpcLongitudinalPlanSource.lead0),
-    (AccelControllerState.restrict, 0, False, 0.30, 15.0, MpcLongitudinalPlanSource.lead1),
   ],
 )
 def test_non_routine_or_stock_lead_states_keep_stock_jerk_cost(

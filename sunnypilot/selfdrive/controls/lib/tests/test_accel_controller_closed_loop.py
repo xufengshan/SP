@@ -7,7 +7,7 @@ import pytest
 
 from opendbc.car.interfaces import ACCEL_MAX, ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, get_T_FOLLOW
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalPlanSource, STOP_DISTANCE, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_planner import get_max_accel
 from openpilot.selfdrive.test.longitudinal_maneuvers.plant import PRIUS_TSS2_ROUTE_MODEL, LeadObservation, Plant
 from openpilot.sunnypilot.selfdrive.controls.lib import longitudinal_planner as longitudinal_planner_sp
@@ -436,6 +436,35 @@ def test_decel_smoothing_does_not_change_clear_road_acceleration_at_representati
   np.testing.assert_allclose(smoothed.speed, stock_weight.speed, atol=1e-9, rtol=0.0)
   np.testing.assert_allclose(smoothed.effective_accel_max, stock_weight.effective_accel_max, atol=1e-9, rtol=0.0)
   assert smoothed.solver_failures == stock_weight.solver_failures == 0
+
+
+def test_lead_bound_routine_decel_uses_smoothing_without_delaying_initial_braking(monkeypatch):
+  def lead_speed(current_time: float) -> float:
+    return max(22.5, 25.0 - 0.4 * current_time)
+
+  common = dict(
+    duration=8.0, controller_enabled=True, profile=AccelProfile.eco, lead_relevancy=True, speed=29.0,
+    distance_lead=80.0, v_lead=lead_speed, v_cruise=33.528, actuator_delay=0.15, actuator_lag=0.20,
+  )
+  monkeypatch.setattr(longitudinal_planner_sp, "MPC_DECEL_JERK_COST_MULTIPLIER", 1.0)
+  baseline = _run(**common)
+  monkeypatch.setattr(longitudinal_planner_sp, "MPC_DECEL_JERK_COST_MULTIPLIER", MPC_DECEL_JERK_COST_MULTIPLIER)
+  smoothed = _run(**common)
+  response = smoothed.time >= 0.5
+  baseline_gap = baseline.distance_lead - baseline.distance
+  gap = smoothed.distance_lead - smoothed.distance
+
+  assert set(np.asarray(smoothed.source)[response]) <= {LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1}
+  assert np.max(smoothed.required_decel[response]) < 0.80
+  assert float(np.percentile(np.abs(_filtered_realized_jerk(smoothed)), 95)) < float(np.percentile(np.abs(_filtered_realized_jerk(baseline)), 95))
+  assert float(np.percentile(np.abs(_command_jerk(smoothed, after=0.5)), 95)) < float(np.percentile(np.abs(_command_jerk(baseline, after=0.5)), 95))
+  assert _first_time_below(smoothed, -0.2) <= _first_time_below(baseline, -0.2) + 1e-6
+  assert _first_time_below(smoothed, -0.5) <= _first_time_below(baseline, -0.5) + 0.25 + 1e-6
+  assert np.min(gap) >= np.min(baseline_gap) - 0.25
+  assert np.max(np.abs(_command_jerk(smoothed, after=0.5))) < 3.0
+  assert not _has_propulsion_brake_cycle(smoothed.a_target[response])
+  assert not smoothed.fcw.any()
+  assert smoothed.solver_failures == 0
 
 
 def test_prius_route_model_launches_without_a_dead_pedal():

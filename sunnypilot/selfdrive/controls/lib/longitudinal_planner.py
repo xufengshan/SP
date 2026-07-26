@@ -11,7 +11,6 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalPlanSource as MpcLongitudinalPlanSource
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality import AccelController, AccelControllerState, AccelProfile
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import (
@@ -166,7 +165,7 @@ class LongitudinalPlannerSP:
       smoothing_blocked = True
     elif not lead_restriction:
       smoothing_blocked = False
-    elif not smoothing_blocked and (getattr(self.mpc, 'source', None) != MpcLongitudinalPlanSource.cruise or not smoothing_eligible):
+    elif not smoothing_blocked and not smoothing_eligible:
       smoothing_blocked = True
     self._accel_jerk_smoothing_blocked = smoothing_blocked
     jerk_cost_multiplier = MPC_DECEL_JERK_COST_MULTIPLIER if smoothing_eligible and not smoothing_blocked else 1.0
