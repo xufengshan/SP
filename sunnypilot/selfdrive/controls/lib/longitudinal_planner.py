@@ -5,6 +5,9 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
+from collections import deque
+import math
+
 from cereal import messaging, custom
 from opendbc.car import structs
 from openpilot.common.constants import CV
@@ -14,7 +17,8 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality import AccelController, AccelControllerState, AccelProfile
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import (
-  MPC_DECEL_JERK_COST_MULTIPLIER, MPC_DECEL_JERK_MAX_REQUIRED_DECEL, MPC_DECEL_JERK_MAX_TARGET_REDUCTION,
+  MPC_DECEL_JERK_COST_MULTIPLIER, MPC_DECEL_JERK_MAX_REQUIRED_DECEL, MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE,
+  MPC_DECEL_JERK_MAX_TARGET_REDUCTION,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
@@ -43,6 +47,9 @@ class LongitudinalPlannerSP:
     self.accel_controller = AccelController(CP, dt=dt)
     self.accel_controller_result = None
     self._accel_jerk_smoothing_blocked = False
+    self._accel_required_decel_samples = deque(maxlen=4)
+    self._accel_required_decel_lead = -1
+    self._dt = dt
     self._radar_log_mono_time = None
     self._radar_fresh_this_cycle = True
 
@@ -158,8 +165,18 @@ class LongitudinalPlannerSP:
       actuating and prev_accel_constraint and result.state == AccelControllerState.restrict and result.selected_lead >= 0
       and not result.launching and target_reduction > 1e-6
     )
+    if not lead_restriction or result.selected_lead != self._accel_required_decel_lead or not math.isfinite(result.required_decel):
+      self._accel_required_decel_samples.clear()
+    if lead_restriction and math.isfinite(result.required_decel):
+      self._accel_required_decel_samples.append(result.required_decel)
+    self._accel_required_decel_lead = result.selected_lead if lead_restriction else -1
+    required_decel_history = tuple(self._accel_required_decel_samples)
+    tightening_lead = (len(required_decel_history) == self._accel_required_decel_samples.maxlen
+                       and (required_decel_history[-1] - required_decel_history[0]) /
+                       (self._dt * (len(required_decel_history) - 1)) > MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE
+                       and sum(after > before for before, after in zip(required_decel_history[:-1], required_decel_history[1:], strict=True)) >= 2)
     smoothing_eligible = (lead_restriction and target_reduction < MPC_DECEL_JERK_MAX_TARGET_REDUCTION
-                          and 0.0 < result.required_decel < MPC_DECEL_JERK_MAX_REQUIRED_DECEL)
+                          and 0.0 < result.required_decel < MPC_DECEL_JERK_MAX_REQUIRED_DECEL and not tightening_lead)
     smoothing_blocked = getattr(self, '_accel_jerk_smoothing_blocked', False)
     if previous_mpc_failed:
       smoothing_blocked = True
@@ -185,7 +202,7 @@ class LongitudinalPlannerSP:
     self._radar_fresh_this_cycle = self._update_radar_freshness(sm)
     self._read_accel_controller_params()
     self.events_sp.clear()
-    self.dec.update(sm, radar_fresh=self._radar_fresh_this_cycle)
+    self.dec.update(sm, radar_fresh=self._radar_fresh_this_cycle, planner_accel=self.output_a_target)
     self.e2e_alerts_helper.update(sm, self.events_sp)
 
   def publish_longitudinal_plan_sp(self, sm: messaging.SubMaster, pm: messaging.PubMaster) -> None:

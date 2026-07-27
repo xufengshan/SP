@@ -526,6 +526,26 @@ class TestPaceAndLifecycle:
     assert results[launch_index].departure_launching
     assert results[launch_index].effective_accel_max == pytest.approx(results[launch_index].positive_accel_max)
 
+  def test_stopped_governing_lead_rejects_route_51d_radar_speed_pulse_without_delaying_departure(self):
+    controller = make_controller()
+    enter_stop_hold(controller, v_ego=0.0)
+    speed_pulse = (0.1361, 0.1731, 0.2146, 0.2253, 0.2137, 0.1877)
+    distances = (6.0, 6.0, 6.0, 5.96, 6.04, 6.04)
+
+    for distance, speed in zip(distances, speed_pulse, strict=True):
+      radar = make_radar(make_lead(status=True, d_rel=distance, v_lead_k=speed, radar_track_id=4887),
+                         make_lead(status=True, d_rel=6.08, v_lead_k=0.0, radar_track_id=4905))
+      held = update(controller, radar, base_speed=8.0, v_ego=0.0)
+      assert held.state == AccelControllerState.stopHold
+      assert held.target_speed == 0.0 and not held.launching
+
+    departing = make_radar(make_lead(status=True, d_rel=6.4, v_lead_k=2.0, radar_track_id=4887),
+                           make_lead(status=True, d_rel=6.48, v_lead_k=2.0, radar_track_id=4905))
+    results = [update(controller, departing, base_speed=8.0, v_ego=0.0) for _ in range(STOP_HOLD_EXIT_FRAMES)]
+
+    assert all(result.state == AccelControllerState.stopHold for result in results[:-1])
+    assert results[-1].launching and results[-1].departure_launching
+
   def test_reused_radar_does_not_pulse_stop_hold_or_departure_target(self):
     controller = make_controller()
     enter_stop_hold(controller)

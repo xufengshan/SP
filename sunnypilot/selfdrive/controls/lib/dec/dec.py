@@ -6,12 +6,15 @@ See the LICENSE.md file in the root directory for more details.
 """
 # Version = 2025-6-30
 
+from collections import deque
+import math
 from typing import Literal
 
 from cereal import messaging
 from numpy import interp
 from opendbc.car import structs
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.constants import WMACConstants
 
 ModeType = Literal['acc', 'blended']
@@ -168,6 +171,10 @@ class DynamicExperimentalController:
     self._expected_distance = 0.0
     self._trajectory_valid = False
     self._raw_urgency = 0.0
+    self._model_accel_samples = deque(maxlen=WMACConstants.MODEL_DECEL_TREND_FRAMES)
+    self._model_decel_trending = False
+    self._model_decel_latched = False
+    self._planner_accel = math.nan
 
   def _read_params(self) -> None:
     if self._frame % WMACConstants.PARAM_READ_FRAMES == 0:
@@ -234,6 +241,7 @@ class DynamicExperimentalController:
     self._expected_distance = 0.0
     self._trajectory_valid = False
 
+    self._update_model_decel_trend(md)
     urgency = self._model_action_urgency(md)
     position_valid = len(md.position.x) == WMACConstants.TRAJECTORY_SIZE
 
@@ -246,6 +254,31 @@ class DynamicExperimentalController:
     self._raw_urgency = clip01(urgency)
     self._has_slow_down = self._slow_down_tracker.update(self._raw_urgency)
     self._urgency = self._slow_down_tracker.value
+
+  def _update_model_decel_trend(self, md) -> None:
+    try:
+      desired_accel = float(md.action.desiredAcceleration)
+    except (AttributeError, OverflowError, TypeError, ValueError):
+      desired_accel = math.nan
+    if not math.isfinite(desired_accel):
+      self._reset_model_decel_trend()
+    else:
+      self._model_accel_samples.append(desired_accel)
+    history = tuple(self._model_accel_samples)
+    self._model_decel_trending = (len(history) == self._model_accel_samples.maxlen
+                                  and history[-1] <= WMACConstants.MODEL_DECEL_TREND_ACCEL
+                                  and (history[0] - history[-1]) / (DT_MDL * (len(history) - 1)) > WMACConstants.MODEL_DECEL_TREND_RATE
+                                  and all(after <= before for before, after in zip(history[:-1], history[1:], strict=True))
+                                  and sum(after < before for before, after in zip(history[:-1], history[1:], strict=True)) >= 2)
+    if len(history) == self._model_accel_samples.maxlen and all(
+      accel >= WMACConstants.MODEL_DECEL_TREND_RELEASE_ACCEL for accel in history
+    ):
+      self._model_decel_latched = False
+
+  def _reset_model_decel_trend(self) -> None:
+    self._model_accel_samples.clear()
+    self._model_decel_trending = False
+    self._model_decel_latched = False
 
   def _radar_acc_lead_score(self, lead_one) -> float:
     radar_track_id = int(getattr(lead_one, 'radarTrackId', -1))
@@ -290,11 +323,21 @@ class DynamicExperimentalController:
 
     return urgency
 
+  def _model_decel_handoff_ready(self) -> bool:
+    try:
+      mpc_accel = float(self._mpc.a_solution[1])
+      return (math.isfinite(mpc_accel) and mpc_accel <= WMACConstants.MODEL_DECEL_TREND_MAX_MPC_ACCEL
+              and math.isfinite(self._planner_accel) and self._planner_accel <= WMACConstants.MODEL_DECEL_TREND_MAX_MPC_ACCEL
+              and self._planner_accel - self._model_accel_samples[-1] <= WMACConstants.MODEL_DECEL_TREND_MAX_COMMAND_STEP)
+    except (AttributeError, IndexError, OverflowError, TypeError, ValueError):
+      return False
+
   def _desired_mode(self) -> tuple[ModeType, bool]:
     standstill = self._standstill_count > WMACConstants.STANDSTILL_FRAMES
     urgent_slow_down = self._has_slow_down and self._raw_urgency > WMACConstants.URGENT_SLOW_DOWN_PROB
 
     if not self._CP.radarUnavailable and self._has_current_radar_acc_lead:
+      self._reset_model_decel_trend()
       return 'acc', True
 
     radar_stale = not self._radar_fresh if self._has_mpc_fcw else self._radar_stale_frames > 1
@@ -304,7 +347,13 @@ class DynamicExperimentalController:
       return 'blended', True
 
     if not self._CP.radarUnavailable and self._has_radar_acc_lead:
+      self._reset_model_decel_trend()
       return 'acc', True
+
+    entering_model_slowdown = self._model_decel_trending and self._model_decel_handoff_ready() and not self._model_decel_latched
+    self._model_decel_latched |= entering_model_slowdown
+    if self._model_decel_latched:
+      return 'blended', entering_model_slowdown
 
     if self._has_mpc_fcw:
       return 'blended', True
@@ -319,15 +368,24 @@ class DynamicExperimentalController:
 
     return 'acc', False
 
-  def update(self, sm: messaging.SubMaster, *, radar_fresh: bool = True) -> None:
+  def update(self, sm: messaging.SubMaster, *, radar_fresh: bool = True, planner_accel: float | None = None) -> None:
     self._read_params()
     self.set_mpc_fcw_crash_cnt()
+    try:
+      self._planner_accel = float(planner_accel)
+    except (OverflowError, TypeError, ValueError):
+      self._planner_accel = math.nan
     self._update_calculations(sm, radar_fresh)
+    self._active = sm['selfdriveState'].experimentalMode and self._enabled
+    if not self._active:
+      model_decel_latched = self._model_decel_latched
+      self._reset_model_decel_trend()
+      if model_decel_latched:
+        self._mode_manager.request_mode('acc', immediate=True)
 
     mode, immediate = self._desired_mode()
     self._mode_manager.request_mode(mode, immediate=immediate, hold_frames=WMACConstants.EMERGENCY_HOLD_FRAMES,
                                     cancel_hold=not self._CP.radarUnavailable and self._has_radar_acc_lead)
     self._mode_manager.update()
 
-    self._active = sm['selfdriveState'].experimentalMode and self._enabled
     self._frame += 1

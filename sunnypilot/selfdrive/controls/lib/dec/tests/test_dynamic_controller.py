@@ -77,6 +77,7 @@ def mock_cp():
 def mock_mpc():
   class MPC:
     crash_cnt = 0
+    a_solution = [0.0, 0.0]
   return MPC()
 
 
@@ -157,6 +158,159 @@ def test_model_should_stop_triggers_blended_without_valid_trajectory(mock_cp, mo
 
   assert not controller._trajectory_valid
   assert controller.mode() == "blended"
+
+
+def test_confirmed_model_decel_trend_enters_blended_before_a_large_command(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+
+  for desired_acceleration in (-0.02, -0.05, -0.08):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.0)
+    assert controller.mode() == "acc"
+
+  default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=-0.12)
+  controller.update(default_sm, planner_accel=0.0)
+
+  assert controller._model_decel_trending
+  assert not controller._has_slow_down
+  assert controller.mode() == "blended"
+
+
+def test_confirmed_model_decel_handoff_stays_latched_through_a_plateau(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.0)
+
+  for _ in range(WMACConstants.EMERGENCY_HOLD_FRAMES + WMACConstants.EXIT_BLENDED_FRAMES + 1):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=-0.12)
+    controller.update(default_sm, planner_accel=0.0)
+
+  assert not controller._model_decel_trending
+  assert controller._model_decel_latched
+  assert controller.mode() == "blended"
+
+  for _ in range(WMACConstants.MODEL_DECEL_TREND_FRAMES + WMACConstants.EXIT_BLENDED_FRAMES):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=0.0)
+    controller.update(default_sm, planner_accel=0.0)
+
+  assert not controller._model_decel_latched
+  assert controller.mode() == "acc"
+
+
+def test_model_decel_trend_never_overrides_a_radar_lead(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm)
+
+  assert not controller._model_accel_samples
+  assert not controller._model_decel_latched
+  assert controller._has_radar_acc_lead
+  assert controller.mode() == "acc"
+
+
+def test_radar_acquisition_clears_a_latched_model_decel_handoff(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.0)
+  assert controller._model_decel_latched
+
+  default_sm['radarState'] = MockRadarState(status=1.0, radar=True, radarTrackId=7)
+  controller.update(default_sm, planner_accel=0.0)
+
+  assert not controller._model_accel_samples
+  assert not controller._model_decel_latched
+  assert controller.mode() == "acc"
+
+
+def test_model_decel_trend_does_not_accumulate_while_dec_is_inactive(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  default_sm['selfdriveState'].experimentalMode = False
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.0)
+
+  assert not controller._model_accel_samples
+  assert not controller._model_decel_latched
+
+  default_sm['selfdriveState'].experimentalMode = True
+  controller.update(default_sm, planner_accel=0.0)
+  assert not controller._model_decel_trending
+  assert controller.mode() == "acc"
+
+
+def test_disabling_dec_clears_a_latched_model_decel_mode(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.0)
+  assert controller._model_decel_latched
+  assert controller.mode() == "blended"
+
+  default_sm['selfdriveState'].experimentalMode = False
+  default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=0.0)
+  controller.update(default_sm, planner_accel=0.0)
+
+  assert not controller._model_decel_latched
+  assert controller.mode() == "acc"
+
+
+def test_model_decel_trend_waits_while_mpc_is_accelerating(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+  mock_mpc.a_solution[1] = 0.5
+
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.0)
+
+  assert controller._model_decel_trending
+  assert controller.mode() == "acc"
+
+
+def test_steep_model_decel_trend_defers_to_the_existing_urgent_path(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+
+  for desired_acceleration in (0.0, -0.2, -0.4, -0.6):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.05)
+
+  assert controller._model_decel_trending
+  assert controller.mode() == "acc"
+
+
+def test_model_decel_trend_waits_while_the_planner_is_accelerating(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+
+  for desired_acceleration in (-0.02, -0.05, -0.08, -0.12):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm, planner_accel=0.2)
+
+  assert controller._model_decel_trending
+  assert controller.mode() == "acc"
+
+
+def test_alternating_model_accel_noise_does_not_trigger_an_early_handoff(mock_cp, mock_mpc, default_sm):
+  controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+  default_sm['radarState'] = MockRadarState(status=0.0)
+
+  for desired_acceleration in (0.0, -0.2, 0.0, -0.2):
+    default_sm['modelV2'] = MockModelData(valid=False, desired_acceleration=desired_acceleration)
+    controller.update(default_sm)
+
+  assert not controller._model_decel_trending
+  assert controller.mode() == "acc"
 
 
 def test_radar_lead_keeps_acc_over_model_slowdown(mock_cp, mock_mpc, default_sm):

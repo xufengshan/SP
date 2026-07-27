@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -424,7 +423,7 @@ class AccelController:
         separation = path.robust_departure_separation(lead_index)
         if math.isfinite(separation) and path.departure_references[lead_index] is None:
           path.departure_references[lead_index] = separation
-      raw_departure = ((has_lead and envelope.departure_lead_speed > STOP_HOLD_CREEP_SPEED
+      raw_departure = ((has_lead and min(envelope.selected_lead_speed, envelope.departure_lead_speed) > STOP_HOLD_CREEP_SPEED
                         and envelope.departure_cap > STOP_HOLD_CREEP_SPEED)
                        or (not envelope.lead_status and path.lead_loss_frames >= self.lead_loss_hold_frames))
       departed = self._creep_departure(path, envelope) or raw_departure

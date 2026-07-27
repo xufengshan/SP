@@ -1,3 +1,4 @@
+from collections import deque
 import inspect
 import math
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ import pytest
 
 from cereal import custom, log, messaging
 from opendbc.car.interfaces import ACCEL_MAX, ACCEL_MIN
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import N, LongitudinalMpc
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalPlanSource as MpcLongitudinalPlanSource
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality import AccelControllerState, AccelProfile
@@ -40,6 +42,9 @@ def planner_for_mpc_test(*, target_speed=15.0, active=True, is_e2e=False, mpc_ac
   is_e2e_calls = []
   planner.is_e2e = lambda _sm: is_e2e_calls.append(True) or is_e2e
   planner._accel_jerk_smoothing_blocked = False
+  planner._accel_required_decel_samples = deque(maxlen=4)
+  planner._accel_required_decel_lead = -1
+  planner._dt = DT_MDL
   planner.mpc = SimpleNamespace(source=mpc_source, last_solution_status=0)
   planner.update_accel_controller = lambda *_args, **_kwargs: setattr(
     planner, "accel_controller_result",
@@ -272,6 +277,50 @@ def test_ineligible_required_decel_blocks_smoothing_only_until_the_restriction_e
   assert rearmed_calls[0][1] == {"jerk_cost_multiplier": MPC_DECEL_JERK_COST_MULTIPLIER}
 
 
+def test_consistently_tightening_lead_releases_smoothing_until_the_restriction_ends():
+  planner, _ = planner_for_mpc_test(
+    state=AccelControllerState.restrict, selected_lead=0, required_decel=0.18,
+  )
+  _, calls = run_controller_mpc(planner)
+  routine_result = planner.accel_controller_result
+  multipliers = [calls[0][1]["jerk_cost_multiplier"]]
+  for required_decel in (0.20, 0.23, 0.25):
+    result = SimpleNamespace(**(vars(routine_result) | {"required_decel": required_decel}))
+    planner.update_accel_controller = lambda *_args, result=result, **_kwargs: setattr(planner, "accel_controller_result", result)
+    _, calls = run_controller_mpc(planner)
+    multipliers.append(calls[0][1]["jerk_cost_multiplier"])
+
+  assert multipliers == [MPC_DECEL_JERK_COST_MULTIPLIER] * 3 + [1.0]
+
+  easing_result = SimpleNamespace(**(vars(routine_result) | {"required_decel": 0.20}))
+  planner.update_accel_controller = lambda *_args, **_kwargs: setattr(planner, "accel_controller_result", easing_result)
+  _, calls = run_controller_mpc(planner)
+  assert calls[0][1] == {"jerk_cost_multiplier": 1.0}
+
+  free_result = SimpleNamespace(**(vars(routine_result) | {"state": AccelControllerState.free, "target_speed": 20.0}))
+  planner.update_accel_controller = lambda *_args, **_kwargs: setattr(planner, "accel_controller_result", free_result)
+  run_controller_mpc(planner)
+  planner.update_accel_controller = lambda *_args, **_kwargs: setattr(planner, "accel_controller_result", routine_result)
+  _, calls = run_controller_mpc(planner)
+  assert calls[0][1] == {"jerk_cost_multiplier": MPC_DECEL_JERK_COST_MULTIPLIER}
+
+
+def test_one_frame_required_decel_noise_does_not_disable_routine_smoothing():
+  planner, _ = planner_for_mpc_test(
+    state=AccelControllerState.restrict, selected_lead=0, required_decel=0.18,
+  )
+  _, calls = run_controller_mpc(planner)
+  routine_result = planner.accel_controller_result
+  multipliers = [calls[0][1]["jerk_cost_multiplier"]]
+  for required_decel in (0.24, 0.19, 0.22):
+    result = SimpleNamespace(**(vars(routine_result) | {"required_decel": required_decel}))
+    planner.update_accel_controller = lambda *_args, result=result, **_kwargs: setattr(planner, "accel_controller_result", result)
+    _, calls = run_controller_mpc(planner)
+    multipliers.append(calls[0][1]["jerk_cost_multiplier"])
+
+  assert multipliers == [MPC_DECEL_JERK_COST_MULTIPLIER] * 4
+
+
 @pytest.mark.parametrize(
   ("state", "selected_lead", "launching", "required_decel", "target_speed", "mpc_source"),
   [
@@ -335,10 +384,11 @@ def test_radar_freshness_is_computed_once_and_shared_with_dec_and_controller():
   planner._read_accel_controller_params = lambda: None
   planner.events_sp = SimpleNamespace(clear=lambda: None)
   dec_freshness = []
-  planner.dec = SimpleNamespace(update=lambda _sm, *, radar_fresh: dec_freshness.append(radar_fresh))
+  planner.dec = SimpleNamespace(update=lambda _sm, *, radar_fresh, planner_accel: dec_freshness.append(radar_fresh))
   planner.e2e_alerts_helper = SimpleNamespace(update=lambda *_args: None)
   planner.accel_personality = int(AccelProfile.normal)
   planner.accel_personality_enabled = True
+  planner.output_a_target = 0.0
   planner.a_desired = 0.0
   planner.v_desired_filter = SimpleNamespace(x=10.0)
   planner.mpc = SimpleNamespace(source=log.LongitudinalPlan.LongitudinalPlanSource.cruise)

@@ -13,7 +13,8 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.plant import PRIUS_TSS2_ROU
 from openpilot.sunnypilot.selfdrive.controls.lib import longitudinal_planner as longitudinal_planner_sp
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality import AccelControllerState, AccelProfile
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import (
-  MATCHED_PACE_DECEL_RATE, MPC_DECEL_JERK_COST_MULTIPLIER, PACE_TARGET_RESERVE,
+  MATCHED_PACE_DECEL_RATE, MPC_DECEL_JERK_COST_MULTIPLIER, MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE, PACE_TARGET_RESERVE,
+  STOP_HOLD_EXIT_FRAMES,
 )
 
 ACTUATOR_DYNAMICS = (
@@ -387,6 +388,35 @@ def test_dec_retains_acc_through_route_like_radar_marker_dropout():
   assert trace.solver_failures == 0
 
 
+def test_dec_uses_confirmed_model_slowdown_while_the_handoff_is_still_gentle():
+  def model_action(current_time: float, _v_ego: float, _a_ego: float) -> tuple[float, bool]:
+    if current_time < 1.0:
+      return 0.0, False
+    if current_time < 1.75:
+      return -0.5 * (current_time - 1.0), False
+    if current_time < 3.25:
+      return -0.375, False
+    return -0.375 - 0.5 * (current_time - 3.25), False
+
+  trace = _run(
+    duration=4.5, controller_enabled=True, dec_enabled=True, e2e=True, lead_relevancy=False, speed=22.0,
+    v_cruise=22.0, model_action_fn=model_action, actuator_delay=0.15, actuator_lag=0.20,
+  )
+  mode_changes = np.flatnonzero(np.asarray(trace.dec_mode)[1:] != np.asarray(trace.dec_mode)[:-1]) + 1
+  response = trace.time >= 0.5
+
+  assert len(mode_changes) == 1
+  assert trace.dec_mode[mode_changes[0]] == "blended"
+  assert trace.time[mode_changes[0]] <= 1.20 + 1e-9
+  assert -0.10 < trace.a_target[mode_changes[0]] < 0.0
+  assert np.all(np.asarray(trace.dec_mode)[(trace.time >= 1.75) & (trace.time < 3.25)] == "blended")
+  assert np.max(np.abs(_command_jerk(trace)[response[1:]])) < 3.0
+  assert not trace.fcw.any()
+  assert trace.raw_radar_passthrough.all()
+  assert np.all(trace.mpc_calls == 1)
+  assert trace.solver_failures == 0
+
+
 def test_clear_road_launch_is_prompt_and_profiles_separate_above_launch_speed():
   traces = [
     _run(
@@ -467,6 +497,43 @@ def test_lead_bound_routine_decel_uses_smoothing_without_delaying_initial_brakin
   assert smoothed.solver_failures == 0
 
 
+def test_tightening_lead_releases_smoothing_before_late_catchup(monkeypatch):
+  event_time = 3.0
+  lead_jerk = 1.02
+  max_lead_decel = 2.22
+  ramp_time = max_lead_decel / lead_jerk
+
+  def lead_speed(current_time: float) -> float:
+    braking_time = max(current_time - event_time, 0.0)
+    ramp = min(braking_time, ramp_time)
+    return 16.9 - 0.5 * lead_jerk * ramp**2 - max_lead_decel * max(braking_time - ramp_time, 0.0)
+
+  common = dict(
+    duration=7.0, profile=AccelProfile.eco, lead_relevancy=True, speed=15.9, distance_lead=35.7,
+    v_lead=lead_speed, v_cruise=17.4, actuator_delay=0.15, actuator_lag=0.20,
+  )
+  stock = _run(controller_enabled=False, **common)
+  monkeypatch.setattr(longitudinal_planner_sp, "MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE", np.inf)
+  always_smoothed = _run(controller_enabled=True, **common)
+  monkeypatch.setattr(longitudinal_planner_sp, "MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE", MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE)
+  trace = _run(controller_enabled=True, **common)
+  response = trace.time >= event_time
+  response_jerk = trace.time[1:] >= event_time
+  required_decel_rate = (trace.required_decel[3:] - trace.required_decel[:-3]) / (3 * DT_MDL)
+  gap = trace.distance_lead - trace.distance
+  always_smoothed_gap = always_smoothed.distance_lead - always_smoothed.distance
+
+  assert np.max(required_decel_rate[trace.required_decel[3:] >= 0.15]) > MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE
+  assert _first_time_below(trace, -0.5) <= _first_time_below(stock, -0.5) + 1e-9
+  assert _first_time_below(trace, -0.5) <= _first_time_below(always_smoothed, -0.5) - DT_MDL + 1e-9
+  assert np.max(np.abs(np.diff(trace.a_target)[response_jerk] / DT_MDL)) < 3.0
+  assert not _has_brake_coast_brake(trace.a_target[response])
+  assert not _has_propulsion_brake_cycle(trace.a_target[response])
+  assert np.min(gap) >= np.min(always_smoothed_gap) - 1e-6
+  assert not stock.fcw.any() and not always_smoothed.fcw.any() and not trace.fcw.any()
+  assert stock.solver_failures == always_smoothed.solver_failures == trace.solver_failures == 0
+
+
 def test_prius_route_model_launches_without_a_dead_pedal():
   trace = _run(
     duration=3.0, controller_enabled=True, profile=1, lead_relevancy=False, speed=0.0,
@@ -494,6 +561,40 @@ def test_stop_hold_survives_short_full_field_dropout():
   assert np.all(trace.state == int(AccelControllerState.stopHold))
   assert not trace.fcw.any()
   _assert_no_new_solver_failures(trace, baseline)
+
+
+def test_route_51d_duplicate_lead_speed_pulse_cannot_release_stop_hold():
+  pulse_start = 1.0
+  departure_time = 2.0
+  pulse_speeds = (0.1361, 0.1731, 0.2146, 0.2253, 0.2137, 0.1877)
+  pulse_distances = (6.0, 6.0, 6.0, 5.96, 6.04, 6.04)
+
+  def lead_speed(current_time: float) -> float:
+    return 0.0 if current_time < departure_time else 2.0
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation:
+    result = truth | {"radar": True, "radarTrackId": 4887 if lead_name == "leadOne" else 4905}
+    pulse_frame = round((current_time - pulse_start) / DT_MDL)
+    if 0 <= pulse_frame < len(pulse_speeds):
+      speed = pulse_speeds[pulse_frame] if lead_name == "leadOne" else 0.0
+      distance = pulse_distances[pulse_frame] if lead_name == "leadOne" else 6.08
+      result |= {"dRel": distance, "vLead": speed, "vLeadK": speed, "vRel": speed, "aLeadK": 0.0}
+    return result
+
+  trace = _run(
+    duration=3.0, controller_enabled=True, lead_relevancy=True, speed=0.0, distance_lead=6.0,
+    v_lead=lead_speed, v_cruise=8.0, lead_observation_fn=observe, actuator_delay=0.15, actuator_lag=0.20,
+  )
+  pulse = (trace.time >= pulse_start) & (trace.time < pulse_start + len(pulse_speeds) * DT_MDL)
+  launched = np.flatnonzero((trace.time >= departure_time) & trace.launching)
+
+  assert np.all(trace.state[pulse] == int(AccelControllerState.stopHold))
+  assert np.all(trace.target_speed[pulse] == 0.0)
+  assert np.max(trace.speed[pulse]) < 0.01
+  assert len(launched) and trace.time[launched[0]] <= departure_time + STOP_HOLD_EXIT_FRAMES * DT_MDL + 1e-9
+  assert not _has_propulsion_brake_cycle(trace.a_target[trace.time >= departure_time])
+  assert not trace.fcw.any()
+  assert trace.solver_failures == 0
 
 
 @pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
