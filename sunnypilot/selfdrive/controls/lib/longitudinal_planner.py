@@ -46,6 +46,7 @@ class LongitudinalPlannerSP:
     self.e2e_alerts_helper = E2EAlertsHelper()
     self.accel_controller = AccelController(CP, dt=dt)
     self.accel_controller_result = None
+    self.accel_personality_available = bool(CP.openpilotLongitudinalControl)
     self._accel_jerk_smoothing_blocked = False
     self._accel_required_decel_samples = deque(maxlen=4)
     self._accel_required_decel_lead = -1
@@ -125,7 +126,8 @@ class LongitudinalPlannerSP:
     self.accel_controller_result = self.accel_controller.update(
       sm['radarState'], base_speed=base_speed, v_ego=sm['carState'].vEgo, a_ego=sm['carState'].aEgo,
       profile=self.accel_personality, follow_personality=sm['selfdriveState'].personality,
-      enabled=self.accel_personality_enabled, acc_selected=acc_selected, engaged=engaged, cruise_initialized=cruise_initialized,
+      enabled=self.accel_personality_enabled and self.accel_personality_available,
+      acc_selected=acc_selected, engaged=engaged, cruise_initialized=cruise_initialized,
       stock_accel_max=stock_accel_max, previous_should_stop=previous_should_stop,
       radar_fresh=getattr(self, '_radar_fresh_this_cycle', True),
       previous_mpc_source=getattr(getattr(self, 'mpc', None), 'source', None),

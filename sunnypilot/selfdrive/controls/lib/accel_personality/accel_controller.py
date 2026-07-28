@@ -20,7 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants imp
   PACE_RESTRICT_DEADBAND, PROFILE_CONFIGS, RADAR_STALE_TIMEOUT, STOP_GAP_RESERVE, STOP_GAP_RESERVE_DECEL_BP,
   STOP_GAP_RESERVE_LEAD_SPEED,
   STOP_HOLD_CREEP_DISTANCE, STOP_HOLD_CREEP_SPEED, STOP_HOLD_EGO_SPEED, STOP_HOLD_EXIT_FRAMES, STOP_HOLD_EXIT_SPEED,
-  STOP_HOLD_MAX_LEAD_DISTANCE, STOPPED_LEAD_SPEED, VEGO_NOISE_TOLERANCE, AccelProfile,
+  STOP_HOLD_FAST_DEPARTURE_DISTANCE, STOP_HOLD_MAX_LEAD_DISTANCE, STOPPED_LEAD_SPEED, VEGO_NOISE_TOLERANCE, AccelProfile,
 )
 
 
@@ -43,6 +43,9 @@ class EnergyEnvelope:
   departure_lead_index: int = -1
   departure_lead_speed: float = math.inf
   departure_cap: float = math.inf
+  departure_lead_speeds: tuple[float, float] = (math.inf, math.inf)
+  departure_lead_distances: tuple[float, float] = (-math.inf, -math.inf)
+  departure_lead_track_ids: tuple[int, int] = (-1, -1)
   departure_lead_separations: tuple[float, float] = (-math.inf, -math.inf)
   usable_gap: float = math.inf
   closing_speed: float = 0.0
@@ -85,7 +88,9 @@ class _ControllerPath:
   departure_samples: tuple[deque[float], deque[float]] = field(
     default_factory=lambda: (deque(maxlen=CAP_FILTER_FRAMES), deque(maxlen=CAP_FILTER_FRAMES)),
   )
+  departure_motion_samples: deque[float] = field(default_factory=lambda: deque(maxlen=CAP_FILTER_FRAMES))
   departure_references: list[float | None] = field(default_factory=lambda: [None, None])
+  departure_track_ids: list[int] = field(default_factory=lambda: [-1, -1])
   pace: float | None = None
   state: AccelControllerState = AccelControllerState.inactive
   departure_frames: int = 0
@@ -124,7 +129,9 @@ class _ControllerPath:
     self.lead_speed_samples = deque([math.inf] * CAP_FILTER_FRAMES, maxlen=CAP_FILTER_FRAMES)
     self.lead_accel_samples = deque([0.0] * CAP_FILTER_FRAMES, maxlen=CAP_FILTER_FRAMES)
     self.departure_samples = (deque(maxlen=CAP_FILTER_FRAMES), deque(maxlen=CAP_FILTER_FRAMES))
+    self.departure_motion_samples = deque(maxlen=CAP_FILTER_FRAMES)
     self.departure_references = [None, None]
+    self.departure_track_ids = [-1, -1]
     self.pace = None
     self.state = AccelControllerState.inactive
     self.departure_frames = 0
@@ -242,6 +249,8 @@ class AccelController:
     candidates: list[EnergyEnvelope] = []
     departure_candidates: list[tuple[float, int]] = []
     departure_speeds = [math.inf, math.inf]
+    departure_distances = [-math.inf, -math.inf]
+    departure_track_ids = [-1, -1]
     departure_separations = [-math.inf, -math.inf]
     departure_caps = [math.inf, math.inf]
 
@@ -280,6 +289,8 @@ class AccelController:
       ))
       departure_candidates.append((departure_distance, lead_index))
       departure_speeds[lead_index] = v_lead_delay
+      departure_distances[lead_index] = d_rel
+      departure_track_ids[lead_index] = self._lead_track_id(lead)
       departure_separations[lead_index] = separation
       departure_caps[lead_index] = departure_cap
 
@@ -294,7 +305,9 @@ class AccelController:
       selected_lead_speed=selected.selected_lead_speed,
       selected_lead_accel=selected.selected_lead_accel,
       departure_lead_index=departure_lead_index, departure_lead_speed=departure_lead_speed,
-      departure_cap=departure_caps[departure_lead_index], departure_lead_separations=tuple(departure_separations),
+      departure_cap=departure_caps[departure_lead_index], departure_lead_speeds=tuple(departure_speeds),
+      departure_lead_distances=tuple(departure_distances), departure_lead_track_ids=tuple(departure_track_ids),
+      departure_lead_separations=tuple(departure_separations),
       usable_gap=selected.usable_gap, closing_speed=selected.closing_speed, required_decel=selected.required_decel,
       has_nearly_stopped_lead=departure_lead_speed < STOPPED_LEAD_SPEED, lead_status=lead_status,
     )
@@ -307,37 +320,71 @@ class AccelController:
   def _lead_source(source) -> bool:
     return source in (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1)
 
-  @staticmethod
-  def _update_samples(path: _ControllerPath, envelope: EnergyEnvelope) -> bool:
+  def _update_samples(self, path: _ControllerPath, envelope: EnergyEnvelope) -> bool:
     had_filtered_lead = math.isfinite(path.filtered_cap)
     has_lead = envelope.selected_lead >= 0
     path.cap_samples.append(envelope.cap if has_lead else math.inf)
     path.lead_speed_samples.append(envelope.selected_lead_speed if has_lead else math.inf)
     path.lead_accel_samples.append(envelope.selected_lead_accel if has_lead else 0.0)
     path.lead_loss_frames = 0 if has_lead else path.lead_loss_frames + 1
-    for lead_index, separation in enumerate(envelope.departure_lead_separations):
-      if math.isfinite(separation):
-        path.departure_samples[lead_index].append(separation)
+    for lead_index, distance in enumerate(envelope.departure_lead_distances):
+      if not math.isfinite(distance):
+        continue
+      samples = path.departure_samples[lead_index]
+      track_id = envelope.departure_lead_track_ids[lead_index]
+      identity_changed = bool(samples) and track_id != path.departure_track_ids[lead_index] and (track_id >= 0 or path.departure_track_ids[lead_index] >= 0)
+      max_distance_step = max(STOP_HOLD_CREEP_DISTANCE / 2.0, 3.0 * envelope.departure_lead_speeds[lead_index] * self.dt)
+      geometry_jump = bool(samples) and abs(distance - samples[-1]) > max_distance_step
+      if identity_changed or geometry_jump:
+        samples.clear()
+        path.departure_references[lead_index] = distance
+      samples.append(distance)
+      path.departure_track_ids[lead_index] = track_id
+    lead_index = envelope.departure_lead_index
+    if lead_index >= 0:
+      distance = envelope.departure_lead_distances[lead_index]
+      samples = path.departure_motion_samples
+      max_distance_step = max(STOP_HOLD_CREEP_DISTANCE / 2.0, 3.0 * envelope.departure_lead_speed * self.dt)
+      if samples and abs(distance - samples[-1]) > max_distance_step:
+        samples.clear()
+      samples.append(distance)
     return not had_filtered_lead and math.isfinite(path.filtered_cap)
 
   @staticmethod
   def _seed_departure_tracking(path: _ControllerPath, envelope: EnergyEnvelope) -> None:
     path.departure_samples = (deque(maxlen=CAP_FILTER_FRAMES), deque(maxlen=CAP_FILTER_FRAMES))
+    path.departure_motion_samples = deque(maxlen=CAP_FILTER_FRAMES)
     path.departure_references = [None, None]
-    for lead_index, separation in enumerate(envelope.departure_lead_separations):
-      if math.isfinite(separation):
-        path.departure_samples[lead_index].append(separation)
-        path.departure_references[lead_index] = separation
+    path.departure_track_ids = list(envelope.departure_lead_track_ids)
+    for lead_index, distance in enumerate(envelope.departure_lead_distances):
+      if math.isfinite(distance):
+        path.departure_samples[lead_index].append(distance)
+        path.departure_references[lead_index] = distance
+    if envelope.departure_lead_index >= 0:
+      path.departure_motion_samples.append(envelope.departure_lead_distances[envelope.departure_lead_index])
     path.departure_frames = 0
 
   @staticmethod
-  def _creep_departure(path: _ControllerPath, envelope: EnergyEnvelope) -> bool:
+  def _departure_progress(path: _ControllerPath, envelope: EnergyEnvelope, minimum_distance: float, *, robust: bool = True) -> bool:
     lead_index = envelope.departure_lead_index
     if lead_index < 0 or envelope.departure_lead_speed <= STOP_HOLD_CREEP_SPEED:
       return False
     reference = path.departure_references[lead_index]
-    separation = path.robust_departure_separation(lead_index)
-    return reference is not None and separation - reference >= STOP_HOLD_CREEP_DISTANCE
+    samples = path.departure_samples[lead_index]
+    distance = path.robust_departure_separation(lead_index) if robust else samples[-1] if samples else -math.inf
+    return reference is not None and distance - reference >= minimum_distance
+
+  @classmethod
+  def _creep_departure(cls, path: _ControllerPath, envelope: EnergyEnvelope) -> bool:
+    return cls._departure_progress(path, envelope, STOP_HOLD_CREEP_DISTANCE)
+
+  @staticmethod
+  def _recent_departure_motion(path: _ControllerPath) -> bool:
+    samples = tuple(path.departure_motion_samples)[-STOP_HOLD_EXIT_FRAMES:]
+    if len(samples) < STOP_HOLD_EXIT_FRAMES:
+      return False
+    deltas = np.diff(samples)
+    return samples[-1] - samples[0] >= STOP_HOLD_FAST_DEPARTURE_DISTANCE and np.count_nonzero(deltas > 0.005) >= 2
 
   def _enter_stop_hold(self, path: _ControllerPath, envelope: EnergyEnvelope) -> None:
     if path.state != AccelControllerState.stopHold:
@@ -390,8 +437,8 @@ class AccelController:
     stop_evidence = (stopped_lead_hold or envelope.cap < 0.50 or filtered_cap < 0.50
                      or (previous_stop and not path.launching) or invalid_lead)
     confirmed_creep_departure = (path.launching and path.departure_launch and has_lead
-                                 and (envelope.departure_lead_speed > STOP_HOLD_CREEP_SPEED
-                                      or self._creep_departure(path, envelope)))
+                                 and (self._departure_progress(path, envelope, STOP_HOLD_FAST_DEPARTURE_DISTANCE)
+                                      or self._recent_departure_motion(path)))
     if (path.active_frames >= self.lead_loss_hold_frames and math.isfinite(filtered_cap)
         and has_lead and planner_accel <= BRAKING_ACCEL_LIMIT_THRESHOLD):
       path.braking_limited = True
@@ -423,13 +470,17 @@ class AccelController:
         separation = path.robust_departure_separation(lead_index)
         if math.isfinite(separation) and path.departure_references[lead_index] is None:
           path.departure_references[lead_index] = separation
-      raw_departure = ((has_lead and min(envelope.selected_lead_speed, envelope.departure_lead_speed) > STOP_HOLD_CREEP_SPEED
-                        and envelope.departure_cap > STOP_HOLD_CREEP_SPEED)
+      fast_departure = (has_lead and min(envelope.selected_lead_speed, envelope.departure_lead_speed) > STOP_HOLD_EXIT_SPEED
+                        and envelope.departure_cap > STOP_HOLD_EXIT_SPEED)
+      raw_departure = (fast_departure
                        or (not envelope.lead_status and path.lead_loss_frames >= self.lead_loss_hold_frames))
       departed = self._creep_departure(path, envelope) or raw_departure
+      if fast_departure and path.departure_frames == 0 and path.departure_motion_samples:
+        path.departure_motion_samples = deque([path.departure_motion_samples[-1]], maxlen=CAP_FILTER_FRAMES)
       path.departure_frames = path.departure_frames + 1 if departed else 0
       path.pace = 0.0
-      if path.departure_frames < STOP_HOLD_EXIT_FRAMES:
+      fast_departure_confirmed = fast_departure and self._recent_departure_motion(path)
+      if path.departure_frames < STOP_HOLD_EXIT_FRAMES or (fast_departure and not fast_departure_confirmed):
         return path.pace
       path.pace = base_speed
       path.state = AccelControllerState.release
@@ -589,28 +640,29 @@ class AccelController:
     planner_speed = sanitized_v_ego if planner_speed is None else planner_speed
     valid_context = self._valid_context(base_speed, sanitized_v_ego, a_ego, planner_speed, planner_accel, stock_accel_max, self._delay(),
                                         engaged, cruise_initialized)
-    if valid_context and radar_fresh:
+    feature_context = valid_context and bool(enabled)
+    if feature_context and radar_fresh:
       envelope = self.calculate_energy_envelope(radar_state, sanitized_v_ego, a_ego, selected_profile, follow_personality)
       self._held_envelope = envelope
-    elif valid_context and self._held_envelope is not None:
+    elif feature_context and self._held_envelope is not None:
       envelope = self._held_envelope
     else:
       envelope = EnergyEnvelope(lead_status=self._radar_has_lead(radar_state))
-      if not valid_context:
+      if not feature_context:
         self._held_envelope = None
 
-    shadow_fresh = self._update_freshness(self.shadow, radar_fresh) if valid_context else False
-    if valid_context and radar_fresh:
+    shadow_fresh = self._update_freshness(self.shadow, radar_fresh) if feature_context else False
+    if feature_context and radar_fresh:
       self._update_path(self.shadow, envelope, base_speed, sanitized_v_ego, selected_profile, profile_accel_max, previous_should_stop,
                         previous_mpc_source, planner_speed, planner_accel)
       shadow_active = True
-    elif valid_context and not shadow_fresh and self.shadow.pace is not None:
+    elif feature_context and not shadow_fresh and self.shadow.pace is not None:
       shadow_active = True
     else:
       self.shadow.reset()
       shadow_active = False
 
-    live_context = valid_context and bool(enabled) and bool(acc_selected)
+    live_context = feature_context and bool(acc_selected)
     live_fresh = self._update_freshness(self.live, radar_fresh) if live_context else False
     if live_context and radar_fresh:
       pace_target = self._update_path(self.live, envelope, base_speed, sanitized_v_ego, selected_profile, profile_accel_max,

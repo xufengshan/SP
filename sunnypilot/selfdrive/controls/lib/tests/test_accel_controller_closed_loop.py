@@ -563,6 +563,59 @@ def test_stop_hold_survives_short_full_field_dropout():
   _assert_no_new_solver_failures(trace, baseline)
 
 
+@pytest.mark.parametrize("replacement_track_id", (100, 200), ids=("same-track", "replacement"))
+def test_stop_hold_rejects_persistent_same_slot_range_step(replacement_track_id):
+  step_time = 1.0
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    if lead_name == "leadTwo":
+      return None
+    stepped = current_time >= step_time
+    speed = 0.2 if stepped else 0.0
+    return truth | {"dRel": truth["dRel"] + 0.4 * stepped, "vLead": speed, "vLeadK": speed, "vRel": speed,
+                    "aLeadK": 0.0, "radarTrackId": replacement_track_id if stepped else 100, "radar": True}
+
+  trace = _run(
+    duration=2.5, controller_enabled=True, lead_relevancy=True, speed=0.0, distance_lead=6.0,
+    v_lead=0.0, v_cruise=8.0, lead_observation_fn=observe, actuator_delay=0.15, actuator_lag=0.20,
+  )
+
+  assert np.all(trace.state == int(AccelControllerState.stopHold))
+  assert np.all(trace.target_speed == 0.0)
+  assert trace.should_stop.all()
+  assert np.max(trace.speed) < 1e-3
+  assert not trace.fcw.any()
+  assert trace.solver_failures == 0
+
+
+def test_moving_departure_crossing_exit_speed_releases_once():
+  departure_time = 1.0
+  speeds = (0.81, 0.82, 0.83, 0.84, 0.79, 0.76, 0.74, 0.72)
+
+  def lead_speed(current_time: float) -> float:
+    frame = round((current_time - departure_time) / DT_MDL)
+    return 0.0 if frame < 0 else speeds[min(frame, len(speeds) - 1)]
+
+  def observe(_current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    return None if lead_name == "leadTwo" else truth | {"aLeadK": 0.0, "radarTrackId": 100, "radar": True}
+
+  trace = _run(
+    duration=3.0, controller_enabled=True, lead_relevancy=True, speed=0.0, distance_lead=6.0,
+    v_lead=lead_speed, v_cruise=8.0, lead_observation_fn=observe, actuator_delay=0.15, actuator_lag=0.20,
+  )
+  after_departure = trace.time >= departure_time
+  stop_hold = int(AccelControllerState.stopHold)
+  releases = np.flatnonzero((trace.state[:-1] == stop_hold) & (trace.state[1:] != stop_hold)) + 1
+
+  assert len(releases) == 1
+  assert trace.launching[releases[0]]
+  assert not np.any(trace.state[releases[0]:] == stop_hold)
+  assert np.count_nonzero(np.diff(trace.should_stop[after_departure].astype(int))) == 1
+  assert not _has_propulsion_brake_cycle(trace.a_target[after_departure])
+  assert not trace.fcw.any()
+  assert trace.solver_failures == 0
+
+
 def test_route_51d_duplicate_lead_speed_pulse_cannot_release_stop_hold():
   pulse_start = 1.0
   departure_time = 2.0
@@ -592,6 +645,45 @@ def test_route_51d_duplicate_lead_speed_pulse_cannot_release_stop_hold():
   assert np.all(trace.target_speed[pulse] == 0.0)
   assert np.max(trace.speed[pulse]) < 0.01
   assert len(launched) and trace.time[launched[0]] <= departure_time + STOP_HOLD_EXIT_FRAMES * DT_MDL + 1e-9
+  assert not _has_propulsion_brake_cycle(trace.a_target[trace.time >= departure_time])
+  assert not trace.fcw.any()
+  assert trace.solver_failures == 0
+
+
+def test_route_520_slow_lead_pulse_cannot_release_stop_hold_or_dampen_real_departure():
+  pulse_start = 1.0
+  departure_time = 2.5
+  pulse_speeds = (0.01, 0.03, 0.07, 0.10, 0.14, 0.20, 0.26, 0.32, 0.34, 0.33, 0.31, 0.28, 0.24, 0.20, 0.15, 0.09, 0.05, 0.01)
+  pulse_offsets = (0.00, 0.00, 0.00, 0.01, 0.01, 0.02, 0.03, 0.04, 0.06, 0.07, 0.09, 0.11, 0.12, 0.13, 0.14, 0.15, 0.15, 0.16)
+
+  def lead_speed(current_time: float) -> float:
+    return 0.0 if current_time < departure_time else 2.0
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    if lead_name == "leadTwo":
+      return None
+    pulse_frame = round((current_time - pulse_start) / DT_MDL)
+    if 0 <= pulse_frame < len(pulse_speeds):
+      speed = pulse_speeds[pulse_frame]
+      return truth | {"dRel": 6.0 + pulse_offsets[pulse_frame], "vLead": speed, "vLeadK": speed, "vRel": speed,
+                      "aLeadK": 0.0, "radarTrackId": 2133, "radar": True}
+    return truth | {"aLeadK": 0.0, "radarTrackId": 2133, "radar": True}
+
+  common = dict(
+    duration=4.0, lead_relevancy=True, speed=0.0, distance_lead=6.0, v_lead=lead_speed, v_cruise=8.0,
+    lead_observation_fn=observe, actuator_model=PRIUS_TSS2_ROUTE_MODEL,
+  )
+  baseline = _run(controller_enabled=False, **common)
+  trace = _run(controller_enabled=True, **common)
+  pulse = (trace.time >= pulse_start) & (trace.time < pulse_start + len(pulse_speeds) * DT_MDL)
+  release = np.flatnonzero((trace.time >= departure_time) & trace.launching)
+
+  assert np.all(trace.state[pulse] == int(AccelControllerState.stopHold))
+  assert np.all(trace.target_speed[pulse] == 0.0)
+  assert np.max(trace.speed[trace.time < departure_time]) < 0.01
+  assert len(release) and trace.time[release[0]] <= departure_time + STOP_HOLD_EXIT_FRAMES * DT_MDL + 1e-9
+  assert trace.a_target[release[0]] > 0.05
+  assert np.allclose(trace.a_target[release[0]:], baseline.a_target[release[0]:], atol=1e-5, rtol=0.0)
   assert not _has_propulsion_brake_cycle(trace.a_target[trace.time >= departure_time])
   assert not trace.fcw.any()
   assert trace.solver_failures == 0
@@ -723,6 +815,7 @@ def test_constant_creep_departure_does_not_pulse_between_launch_and_stop_hold():
   )
   launched = np.flatnonzero((trace.time >= departure_time) & trace.launching)
   assert len(launched)
+  assert trace.time[launched[0]] <= departure_time + 2.0
   after_launch = slice(launched[0], None)
 
   assert not np.any(trace.state[after_launch] == int(AccelControllerState.stopHold))

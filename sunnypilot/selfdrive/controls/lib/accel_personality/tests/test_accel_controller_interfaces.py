@@ -75,6 +75,7 @@ def test_profile_enum_keeps_toyota_importable():
 
   assert AccelPersonality.schema.enumerants == expected
   assert CarState.__module__ == "opendbc.car.toyota.carstate"
+  assert "Params()" not in inspect.getsource(CarState.update)
 
 
 def test_mpc_accepts_optional_acceleration_ceiling_without_changing_stock_bounds():
@@ -356,6 +357,7 @@ def test_controller_receives_previous_mpc_state_and_cached_radar_freshness():
   planner = LongitudinalPlannerSP.__new__(LongitudinalPlannerSP)
   planner.accel_personality = int(AccelProfile.normal)
   planner.accel_personality_enabled = True
+  planner.accel_personality_available = True
   planner._radar_fresh_this_cycle = True
   planner.a_desired = -0.4
   planner.v_desired_filter = SimpleNamespace(x=9.5)
@@ -377,6 +379,25 @@ def test_controller_receives_previous_mpc_state_and_cached_radar_freshness():
   assert received["radar_fresh"] is True
 
 
+def test_controller_is_disabled_when_openpilot_longitudinal_control_is_unavailable():
+  planner = LongitudinalPlannerSP.__new__(LongitudinalPlannerSP)
+  planner.accel_personality = int(AccelProfile.normal)
+  planner.accel_personality_enabled = True
+  planner.accel_personality_available = False
+  planner._radar_fresh_this_cycle = True
+  planner.accel_controller = SimpleNamespace(
+    update=lambda *_args, **kwargs: SimpleNamespace(target_speed=20.0, received_enabled=kwargs["enabled"]),
+  )
+  planner.a_desired = 0.0
+  planner.v_desired_filter = SimpleNamespace(x=10.0)
+  planner.mpc = SimpleNamespace(source=MpcLongitudinalPlanSource.cruise)
+  sm = {"radarState": radar_state(), "carState": SimpleNamespace(vEgo=10.0, aEgo=0.0), "selfdriveState": SimpleNamespace(personality=0)}
+
+  planner.update_accel_controller(sm, 20.0, True, True, True, ACCEL_MAX, False)
+
+  assert not planner.accel_controller_result.received_enabled
+
+
 def test_radar_freshness_is_computed_once_and_shared_with_dec_and_controller():
   planner = LongitudinalPlannerSP.__new__(LongitudinalPlannerSP)
   planner._radar_log_mono_time = None
@@ -388,6 +409,7 @@ def test_radar_freshness_is_computed_once_and_shared_with_dec_and_controller():
   planner.e2e_alerts_helper = SimpleNamespace(update=lambda *_args: None)
   planner.accel_personality = int(AccelProfile.normal)
   planner.accel_personality_enabled = True
+  planner.accel_personality_available = True
   planner.output_a_target = 0.0
   planner.a_desired = 0.0
   planner.v_desired_filter = SimpleNamespace(x=10.0)

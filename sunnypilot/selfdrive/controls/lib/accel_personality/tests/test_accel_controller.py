@@ -183,10 +183,13 @@ class TestMpcCeiling:
     assert np.all(ceiling >= 0.0)
 
   def test_inactive_controller_has_no_custom_ceiling(self):
-    result = update(make_controller(), enabled=False)
+    controller = make_controller()
+    result = update(controller, enabled=False)
     assert not result.active
+    assert not result.shadow_active
     assert result.mpc_accel_max is None
     assert math.isinf(result.effective_accel_max)
+    assert controller.live.pace is None and controller.shadow.pace is None
 
   def test_profile_ceiling_does_not_interfere_while_planner_is_braking(self):
     controller = make_controller()
@@ -513,8 +516,8 @@ class TestPaceAndLifecycle:
     controller = make_controller()
     held = enter_stop_hold(controller)
     assert controller.live.pace == 0.0
-    departing = make_radar(make_lead(status=True, d_rel=8.0, v_lead_k=2.0))
-    results = [update(controller, departing, base_speed=8.0, v_ego=0.1) for _ in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
+    results = [update(controller, make_radar(make_lead(status=True, d_rel=6.0 + (frame + 1) * 0.1, v_lead_k=2.0)),
+                      base_speed=8.0, v_ego=0.1) for frame in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
     launch_index = next(index for index, result in enumerate(results) if result.launching)
 
     assert held.state == AccelControllerState.stopHold
@@ -539,19 +542,126 @@ class TestPaceAndLifecycle:
       assert held.state == AccelControllerState.stopHold
       assert held.target_speed == 0.0 and not held.launching
 
-    departing = make_radar(make_lead(status=True, d_rel=6.4, v_lead_k=2.0, radar_track_id=4887),
-                           make_lead(status=True, d_rel=6.48, v_lead_k=2.0, radar_track_id=4905))
-    results = [update(controller, departing, base_speed=8.0, v_ego=0.0) for _ in range(STOP_HOLD_EXIT_FRAMES)]
+    results = [
+      update(controller, make_radar(make_lead(status=True, d_rel=6.04 + (frame + 1) * 0.1, v_lead_k=2.0, radar_track_id=4887),
+                                    make_lead(status=True, d_rel=6.12 + (frame + 1) * 0.1, v_lead_k=2.0, radar_track_id=4905)),
+             base_speed=8.0, v_ego=0.0)
+      for frame in range(STOP_HOLD_EXIT_FRAMES)
+    ]
 
     assert all(result.state == AccelControllerState.stopHold for result in results[:-1])
     assert results[-1].launching and results[-1].departure_launching
 
+  def test_route_520_slow_lead_pulse_cannot_release_stop_hold_but_real_departure_can(self):
+    controller = make_controller()
+    enter_stop_hold(controller, v_ego=0.0)
+    speeds = (0.01, 0.03, 0.07, 0.10, 0.14, 0.20, 0.26, 0.32, 0.34, 0.33, 0.31, 0.28, 0.24, 0.20, 0.15, 0.09, 0.05, 0.01)
+    offsets = (0.00, 0.00, 0.00, 0.01, 0.01, 0.02, 0.03, 0.04, 0.06, 0.07, 0.09, 0.11, 0.12, 0.13, 0.14, 0.15, 0.15, 0.16)
+
+    for offset, speed in zip(offsets, speeds, strict=True):
+      pulse = make_radar(make_lead(status=True, d_rel=6.0 + offset, v_lead_k=speed, radar_track_id=2133))
+      held = update(controller, pulse, base_speed=8.0, v_ego=0.0)
+      assert held.state == AccelControllerState.stopHold
+      assert held.target_speed == 0.0 and not held.launching
+
+    stopped = make_radar(make_lead(status=True, d_rel=6.2, v_lead_k=0.0, radar_track_id=2133))
+    assert update(controller, stopped, base_speed=8.0, v_ego=0.0).state == AccelControllerState.stopHold
+    results = [update(controller, make_radar(make_lead(status=True, d_rel=6.2 + (frame + 1) * 0.1, v_lead_k=2.0, radar_track_id=2133)),
+                      base_speed=8.0, v_ego=0.0) for frame in range(STOP_HOLD_EXIT_FRAMES)]
+
+    assert all(result.state == AccelControllerState.stopHold for result in results[:-1])
+    assert results[-1].launching and results[-1].departure_launching
+
+  def test_fast_speed_signal_that_slows_without_separating_never_releases_stop_hold(self):
+    controller = make_controller()
+    enter_stop_hold(controller, v_ego=0.0)
+    departing = make_radar(make_lead(status=True, d_rel=5.9, v_lead_k=2.0))
+    results = [update(controller, departing, base_speed=8.0, v_ego=0.0) for _ in range(STOP_HOLD_EXIT_FRAMES)]
+    slowed = update(controller, make_radar(make_lead(status=True, d_rel=6.0, v_lead_k=0.2)), base_speed=8.0, v_ego=0.0)
+
+    assert all(result.state == AccelControllerState.stopHold and not result.launching for result in results)
+    assert slowed.state == AccelControllerState.stopHold
+    assert slowed.target_speed == 0.0 and not slowed.launching
+
+  def test_stop_hold_reseeds_departure_distance_when_radar_track_is_replaced(self):
+    controller = make_controller()
+    original = make_radar(make_lead(status=True, d_rel=6.0, v_lead_k=0.0, radar_track_id=100))
+    update(controller, original, base_speed=8.0, v_ego=0.0, previous_should_stop=True)
+    replacement = make_radar(make_lead(status=True, d_rel=6.4, v_lead_k=0.2, radar_track_id=200))
+    results = [update(controller, replacement, base_speed=8.0, v_ego=0.0) for _ in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
+
+    assert all(result.state == AccelControllerState.stopHold for result in results)
+    assert all(result.target_speed == 0.0 and not result.launching for result in results)
+
+  def test_stop_hold_rejects_persistent_same_track_distance_step(self):
+    controller = make_controller()
+    original = make_radar(make_lead(status=True, d_rel=6.0, v_lead_k=0.0, radar_track_id=100))
+    update(controller, original, base_speed=8.0, v_ego=0.0, previous_should_stop=True)
+    stepped = make_radar(make_lead(status=True, d_rel=6.4, v_lead_k=0.2, radar_track_id=100))
+    results = [update(controller, stepped, base_speed=8.0, v_ego=0.0) for _ in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
+
+    assert all(result.state == AccelControllerState.stopHold for result in results)
+    assert all(result.target_speed == 0.0 and not result.launching for result in results)
+
+  def test_stop_hold_reseeds_non_selected_departure_lead_when_its_track_is_replaced(self):
+    controller = make_controller()
+    original = make_radar(make_lead(status=True, d_rel=3.0, v_lead_k=0.2, radar_track_id=100),
+                          make_lead(status=True, d_rel=6.0, v_lead_k=0.1, radar_track_id=200))
+    update(controller, original, base_speed=8.0, v_ego=0.0, previous_should_stop=True)
+    replacement = make_radar(make_lead(status=True, d_rel=3.4, v_lead_k=0.2, radar_track_id=101),
+                             make_lead(status=True, d_rel=6.0, v_lead_k=0.1, radar_track_id=200))
+    envelope = controller.calculate_energy_envelope(replacement, 0.0, 0.0, AccelProfile.normal)
+    results = [update(controller, replacement, base_speed=8.0, v_ego=0.0) for _ in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
+
+    assert envelope.selected_lead == 1 and envelope.departure_lead_index == 0
+    assert all(result.state == AccelControllerState.stopHold for result in results)
+    assert all(result.target_speed == 0.0 and not result.launching for result in results)
+
+  def test_genuine_departure_survives_lead_slot_and_track_flicker(self):
+    controller = make_controller()
+    enter_stop_hold(controller, v_ego=0.0)
+    results = []
+    for frame in range(STOP_HOLD_EXIT_FRAMES):
+      moving = make_lead(status=True, d_rel=6.0 + (frame + 1) * 0.1, v_lead_k=2.0, radar_track_id=100)
+      secondary = make_lead(status=True, d_rel=7.0, v_lead_k=2.0, radar_track_id=200)
+      results.append(update(controller, make_radar(moving, secondary) if frame % 2 == 0 else make_radar(secondary, moving),
+                            base_speed=8.0, v_ego=0.0))
+
+    assert all(result.state == AccelControllerState.stopHold for result in results[:-1])
+    assert results[-1].launching and results[-1].departure_launching
+
+  def test_fast_speed_glitch_without_distance_progress_stays_in_stop_hold(self):
+    controller = make_controller()
+    stopped = make_radar(make_lead(status=True, d_rel=6.0, v_lead_k=0.0, radar_track_id=100))
+    update(controller, stopped, base_speed=8.0, v_ego=0.0, previous_should_stop=True)
+    glitch = make_radar(make_lead(status=True, d_rel=6.0, v_lead_k=0.9, radar_track_id=100))
+    results = [update(controller, glitch, base_speed=8.0, v_ego=0.0) for _ in range(STOP_HOLD_EXIT_FRAMES)]
+    results.append(update(controller, stopped, base_speed=8.0, v_ego=0.0))
+
+    assert all(result.state == AccelControllerState.stopHold for result in results)
+    assert all(result.target_speed == 0.0 and not result.launching for result in results)
+
+  def test_moving_departure_does_not_reenter_stop_hold_when_speed_crosses_exit_threshold(self):
+    controller = make_controller()
+    stopped = make_radar(make_lead(status=True, d_rel=6.0, v_lead_k=0.0, radar_track_id=100))
+    update(controller, stopped, base_speed=8.0, v_ego=0.0, previous_should_stop=True)
+    distance = 6.0
+    results = []
+    for speed in (0.81, 0.82, 0.83, 0.84, 0.79, 0.76, 0.74, 0.72):
+      distance += speed * DT_MDL
+      radar = make_radar(make_lead(status=True, d_rel=distance, v_lead_k=speed, radar_track_id=100))
+      results.append(update(controller, radar, base_speed=8.0, v_ego=0.0))
+
+    launch_index = next(index for index, result in enumerate(results) if result.launching)
+    assert all(result.state != AccelControllerState.stopHold for result in results[launch_index:])
+    assert all(result.target_speed > 0.0 and result.departure_launching for result in results[launch_index:])
+
   def test_reused_radar_does_not_pulse_stop_hold_or_departure_target(self):
     controller = make_controller()
     enter_stop_hold(controller)
-    departing = make_radar(make_lead(status=True, d_rel=8.0, v_lead_k=2.0))
 
     for frame in range(STOP_HOLD_EXIT_FRAMES):
+      departing = make_radar(make_lead(status=True, d_rel=6.0 + (frame + 1) * 0.1, v_lead_k=2.0))
       fresh = update(controller, departing, base_speed=8.0, v_ego=0.1)
       held = update(controller, departing, base_speed=8.0, v_ego=0.1, radar_fresh=False,
                     previous_mpc_source=LongitudinalPlanSource.lead0, planner_speed=0.01)
@@ -623,14 +733,15 @@ class TestPaceAndLifecycle:
       results.append(update(controller, creeping, base_speed=8.0, v_ego=0.0))
 
     launch_index = next(index for index, result in enumerate(results) if result.launching)
+    assert launch_index * DT_MDL <= 2.0
     assert all(result.state != AccelControllerState.stopHold for result in results[launch_index:])
     assert all(result.target_speed > 0.0 for result in results[launch_index:])
 
   def test_departure_dropout_holds_without_resurrecting_stop_hold(self):
     controller = make_controller()
     enter_stop_hold(controller)
-    departing = make_radar(make_lead(status=True, d_rel=8.0, v_lead_k=2.0))
-    results = [update(controller, departing, base_speed=8.0, v_ego=0.1) for _ in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
+    results = [update(controller, make_radar(make_lead(status=True, d_rel=6.0 + (frame + 1) * 0.1, v_lead_k=2.0)),
+                      base_speed=8.0, v_ego=0.1) for frame in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES)]
     launched = next(result for result in results if result.launching)
     before_dropout = results[-1]
     dropout = [update(controller, base_speed=8.0, v_ego=0.1) for _ in range(controller.lead_loss_hold_frames + 1)]
@@ -644,8 +755,8 @@ class TestPaceAndLifecycle:
   def test_invalid_departure_geometry_returns_to_stop_hold(self):
     controller = make_controller()
     enter_stop_hold(controller)
-    departing = make_radar(make_lead(status=True, d_rel=8.0, v_lead_k=2.0))
-    for _ in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES):
+    for frame in range(CAP_FILTER_FRAMES + STOP_HOLD_EXIT_FRAMES):
+      departing = make_radar(make_lead(status=True, d_rel=6.0 + (frame + 1) * 0.1, v_lead_k=2.0))
       launched = update(controller, departing, base_speed=8.0, v_ego=0.1)
     invalid = make_radar(make_lead(status=True, d_rel=math.nan, v_lead_k=2.0))
     guarded = update(controller, invalid, base_speed=8.0, v_ego=0.1)
@@ -702,6 +813,7 @@ class TestPaceAndLifecycle:
       assert path.pace is None and path.matched_accel_limit is None
       assert path.state == AccelControllerState.inactive
       assert path.departure_frames == path.active_frames == path.lead_loss_frames == path.stale_frames == 0
+      assert not path.departure_motion_samples
       assert not path.launching and not path.departure_launch and not path.matched_lead
       assert not path.braking_limited and not path.braking_handoff and not path.pace_reserve_armed
       assert math.isinf(path.filtered_cap) and math.isinf(path.filtered_lead_speed) and path.filtered_lead_accel == 0.0
