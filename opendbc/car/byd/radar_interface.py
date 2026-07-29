@@ -12,7 +12,7 @@ from opendbc.can.parser import CANParser
 from opendbc.car.byd.values import DBC, CanBus
 
 # -------------------------
-#  ???????????(?? vRel ????,??? KF)
+#  简易输出一阶低通滤波器（用于 vRel 输出平滑，不反哺 KF）
 # -------------------------
 class LowPassFilter:
     def __init__(self, x0: float = 0.0):
@@ -26,17 +26,17 @@ class LowPassFilter:
         return self.x
 
 # --------------------------------------------------------------
-#  ??????????(distance + relative speed)
-#  ?????????? v_meas,???????
+#  简单的一维卡尔曼滤波（distance + relative speed）
+#  支持可选的伪速度观测 v_meas，用马氏距离门控
 # --------------------------------------------------------------
 class SimpleKalmanFilter:
     """
-    ????   x = [d, v_rel]^T
-    ????   ??:
-      - ????? z = d + noise
-      - ??+???? z = [d, v_rel]^T + noise
-    ????   ????? ?_a
-    ????   R (distance variance), Rv (velocity variance) ??
+    状态向量   x = [d, v_rel]^T
+    观测模型   支持:
+      - 仅距离观测 z = d + noise
+      - 距离+速度观测 z = [d, v_rel]^T + noise
+    过程噪声   加速度噪声 σ_a
+    观测噪声   R (distance variance), Rv (velocity variance) 可选
     """
 
     def __init__(
@@ -52,40 +52,40 @@ class SimpleKalmanFilter:
         self.distance_scale = distance_scale
         self.distance_offset = distance_offset
 
-        # ??
+        # 状态
         self.d = float(initial_d)
         self.v_rel = 0.0
-        self.last_v_rel = 0.0  # ???????
+        self.last_v_rel = 0.0  # 用于加速度限幅
 
-        # ?????:??????????
+        # 初始协方差：让速度有较大不确定性
         self.P = np.array([[2.0, 0.0],
                            [0.0, 5.0]])
 
-        # ??
+        # 噪声
         self.sigma_a = sigma_a
         self.R = float(R)  # distance variance
 
-        # ??
+        # 计时
         self.last_time = float(initial_time)
 
-        # ?? / ????
+        # 统计 / 健康检查
         self.invalid_count = 0
         self.measurement_history = deque(maxlen=5)
 
-        # ??/???????(????)
+        # 最小/最大协方差下界（数值稳定）
         self._min_P = 1e-6
 
     # -------------------------
-    # ??:????(????)
+    # 辅助：预测步骤（匀速模型）
     # -------------------------
     def predict(self, dt: float) -> None:
         if dt <= 0:
             return
 
-        # ????
+        # 状态预测
         self.d += self.v_rel * dt
 
-        # ???? Q(?????:??? dt**2)
+        # 过程噪声 Q（标准离散化：右下为 dt**2）
         q = self.sigma_a ** 2
         Q = np.array([[dt ** 4 / 4.0, dt ** 3 / 2.0],
                       [dt ** 3 / 2.0, dt ** 2       ]]) * q
@@ -93,26 +93,26 @@ class SimpleKalmanFilter:
         F = np.array([[1.0, dt],
                       [0.0, 1.0]])
         self.P = F @ self.P @ F.T + Q
-        # ????
+        # 数值下界
         self.P = np.maximum(self.P, self._min_P)
 
     # -------------------------
-    # ????:???????? v_meas ???
+    # 更新步骤：支持可选速度观测 v_meas 与门控
     # -------------------------
     def update(self, d_meas: float, v_meas: Optional[float] = None, Rv: float = 1.0) -> Tuple[bool, float]:
         """
-        ?? (was_updated, md2) ?????????????????????
-        ?? v_meas is None -> ? 1D ??(???)
-        ??? 2D ??(??+??)???????(2 DOF)
+        返回 (was_updated, md2) 表示是否做了更新以及用于门控的马氏距离平方
+        如果 v_meas is None -> 做 1D 更新（仅距离）
+        否则做 2D 更新（距离+速度）并使用马氏门控（2 DOF）
         """
-        # ?????
+        # 基本合法性
         if not (0.5 <= d_meas <= 200.0):
             return False, float('inf')
 
-        # ????(??)
+        # 经验标定（静态）
         z_d = d_meas * self.distance_scale + self.distance_offset
 
-        # ??????? P ???? predict() ???
+        # 预测后的状态与 P 应在外部 predict() 已更新
 
         x_pred = np.array([self.d, self.v_rel])
         # 1D distance only
@@ -120,13 +120,13 @@ class SimpleKalmanFilter:
             H = np.array([[1.0, 0.0]])
             S = H @ self.P @ H.T + self.R  # scalar
             y = np.array([z_d - (H @ x_pred)[0]])
-            # ???? 1D: y^2 / S
+            # 马氏距离 1D: y^2 / S
             md2 = float((y[0] ** 2) / S)
             # 1 DOF chi2 thresholds: 25.0 ~ 99%
             if md2 > 25.0:
                 self.last_md2 = md2
                 return False, md2
-            # ?????
+            # 卡尔曼增益
             K = (self.P @ H.T) / S  # (2,1)
             state = x_pred + (K.flatten() * y[0])
             self.d, self.v_rel = float(state[0]), float(state[1])
@@ -144,7 +144,7 @@ class SimpleKalmanFilter:
             R_mat = np.diag([self.R, float(Rv)])
             S = H @ self.P @ H.T + R_mat
             y = z - x_pred
-            # ???? y^T S^-1 y
+            # 马氏距离 y^T S^-1 y
             try:
                 invS = np.linalg.inv(S)
                 md2 = float(y.T @ invS @ y)
@@ -166,10 +166,10 @@ class SimpleKalmanFilter:
             return True, md2
 
     # -------------------------
-    # ????????????(??,????)
+    # 根据车辆速度简化调整噪声（保守，幅度较小）
     # -------------------------
     def adjust_noise_params(self, v_ego: float) -> None:
-        # ????(???)
+        # 基础映射（较保守）
         if v_ego > 25.0:
             base_sigma_a = 0.12
             base_R = 1.2
@@ -183,12 +183,12 @@ class SimpleKalmanFilter:
             base_sigma_a = 0.12
             base_R = 1.2
 
-        # ????,??????????????
+        # 简单赋值，不做激进自适应以免引入不稳定
         self.sigma_a = base_sigma_a
         self.R = base_R
 
     # -------------------------
-    # ????????(??????)
+    # 限制相对速度突变（平滑器内使用）
     # -------------------------
     def limit_acceleration(self, dt: float, max_accel: float = 2.0) -> None:
         if dt <= 0:
@@ -200,13 +200,13 @@ class SimpleKalmanFilter:
         self.last_v_rel = self.v_rel
 
 # --------------------------------------------------------------
-#  RadarInterface(??????????????????per-target??)
+#  RadarInterface（集成伪速度观测、马氏门控、输出低通、per-target历史）
 # --------------------------------------------------------------
 class RadarInterface(RadarInterfaceBase):
     def __init__(self, CP):
         super().__init__(CP)
 
-        # ---------- ?? CAN ----------
+        # ---------- 基础 CAN ----------
         if CP.radarUnavailable:
             self.rcp = None
         else:
@@ -214,7 +214,7 @@ class RadarInterface(RadarInterfaceBase):
             self.rcp = CANParser(DBC[CP.carFingerprint][Bus.pt], messages, CanBus.MPC)
             self.trigger_msg = 0x374
 
-        # ---------- ???? ----------
+        # ---------- 数据结构 ----------
         self.pts: Dict[int, structs.RadarData.RadarPoint] = {}
         self.kalman_filters: Dict[int, SimpleKalmanFilter] = {}
 
@@ -224,24 +224,24 @@ class RadarInterface(RadarInterfaceBase):
         self.last_valid_long: Dict[int, float] = {}
         self.vrel_filters: Dict[int, LowPassFilter] = {}
 
-        # ---------- ?? ----------
+        # ---------- 统计 ----------
         self.updated_messages = set()
 
-        # ---------- ?? ----------
+        # ---------- 日志 ----------
         self.log_path = "/data/debug/byd_radar_complete_data.log"
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
 
-        # ---------- ?? ----------
+        # ---------- 参数 ----------
         self.max_distance = 200.0
         self.min_distance = 0.5
         self.max_lat_offset = 4.0
         self.max_speed_change = 30.0
         self.max_dist_jump = 10.0
-        self.filter_invalid_frames = 6     # ????
-        self.filter_delete_timeout = 1.5   # ?
+        self.filter_invalid_frames = 6     # 保守一点
+        self.filter_delete_timeout = 1.5   # 秒
 
     # -----------------------------------------------------------------
-    #  ???:per-target ?? + EMA
+    #  前处理：per-target 中值 + EMA
     # -----------------------------------------------------------------
     def preprocess_radar_data(self, target_id: int, raw_dist: float, msg_mrr: dict) -> Optional[float]:
         # per-target median buffer
@@ -264,7 +264,7 @@ class RadarInterface(RadarInterfaceBase):
             return float(new)
 
     # -----------------------------------------------------------------
-    #  ?????(????????)
+    #  生成伪速度（最小二乘线性拟合）
     # -----------------------------------------------------------------
     def compute_pseudo_velocity(self, target_id: int, current_ts: float, d_meas: float) -> Optional[float]:
         h = self.dist_hist.setdefault(target_id, deque(maxlen=6))
@@ -283,13 +283,13 @@ class RadarInterface(RadarInterfaceBase):
             return None
 
     # -----------------------------------------------------------------
-    #  ???(?? CAN ??)
+    #  主循环（每帧 CAN 数据）
     # -----------------------------------------------------------------
     def update(self, can_strings):
         if self.rcp is None:
             return super().update(None)
 
-        # ??????
+        # 使用单调时钟
         current_ts = time.monotonic()
 
         values = self.rcp.update_strings(can_strings)
@@ -300,22 +300,22 @@ class RadarInterface(RadarInterfaceBase):
         msg_mrr = self.rcp.vl['RADAR_MRR']
         target_id = int(msg_mrr['TargetID'])  # 1:left, 2:front, 3:right
 
-        # ???????
+        # 仅处理前向目标
         if target_id != 2:
             return None
 
-        # ??/?? RadarPoint
+        # 创建/获取 RadarPoint
         if target_id not in self.pts:
             self.pts[target_id] = structs.RadarData.RadarPoint()
         rp = self.pts[target_id]
         rp.trackId = target_id
 
-        # ????
+        # 原始测量
         raw_long = float(msg_mrr['LongDist'])
         raw_lat = float(msg_mrr['LatDist'])
         is_valid = raw_long > 0 or bool(msg_mrr['IsValid'])
 
-        # ???????
+        # 基本合法性检查
         if not (self.min_distance <= raw_long <= self.max_distance):
             is_valid = False
         if abs(raw_lat) > self.max_lat_offset:
@@ -323,7 +323,7 @@ class RadarInterface(RadarInterfaceBase):
         if not bool(msg_mrr['IsValid']):
             is_valid = False
 
-        # ?????(per-target last_valid_long)
+        # 连续性检查（per-target last_valid_long）
         if target_id in self.last_valid_long:
             if is_valid:
                 jump = abs(raw_long - self.last_valid_long[target_id])
@@ -335,7 +335,7 @@ class RadarInterface(RadarInterfaceBase):
             if is_valid:
                 self.last_valid_long[target_id] = raw_long
 
-        # ???
+        # 预处理
         if is_valid:
             processed_long = self.preprocess_radar_data(target_id, raw_long, msg_mrr)
             if processed_long is None:
@@ -346,7 +346,7 @@ class RadarInterface(RadarInterfaceBase):
         # Default dt_for_log
         dt_for_log = 0.0
 
-        # ????????
+        # 卡尔曼滤波器管理
         if is_valid:
             if target_id not in self.kalman_filters:
                 kf = SimpleKalmanFilter(
@@ -394,10 +394,10 @@ class RadarInterface(RadarInterfaceBase):
             # update with gating
             updated, md2 = kf.update(raw_long, v_meas, Rv) if v_meas is not None else kf.update(raw_long, None)
 
-            # ?update?????????
+            # 在update调用后添加重置机制
             if not updated:
                 kf.reject_count = getattr(kf, 'reject_count', 0) + 1
-                if kf.reject_count > 5:  # ??5???????
+                if kf.reject_count > 5:  # 连续5帧被拒绝就重置
                     kf.d = raw_long
                     kf.v_rel = 0.0
                     kf.P = np.array([[2.0, 0.0], [0.0, 5.0]])
@@ -437,7 +437,7 @@ class RadarInterface(RadarInterfaceBase):
                 kf.invalid_count = 0
 
         else:
-            # ???? -> ?????????? predict (??????????),??????
+            # 无效测量 -> 如果已有滤波器则仅做 predict (不把无效测量更新进来)，并输出预测值
             if target_id in self.kalman_filters:
                 kf = self.kalman_filters[target_id]
                 dt = float(current_ts - kf.last_time)
@@ -466,7 +466,7 @@ class RadarInterface(RadarInterfaceBase):
                 rp.yvRel = float('nan')
                 rp.measured = False
             else:
-                # ???????,????????
+                # 没有历史滤波器，保留默认或先不填
                 rp.measured = False
                 try:
                     rp.dRel = float(raw_long) if raw_long > 0 else 199.0
@@ -476,7 +476,7 @@ class RadarInterface(RadarInterfaceBase):
                 rp.vLead = float(self.v_ego)
                 rp.yRel = raw_lat
 
-        # ??????(????????)
+        # 速度突变保护（对输出值再次防护）
         if hasattr(rp, 'vRel') and rp.vRel is not None:
             if abs(rp.vRel) > self.max_speed_change:
                 if target_id in self.kalman_filters:
@@ -487,7 +487,7 @@ class RadarInterface(RadarInterfaceBase):
                     rp.vRel = 0.0
                     rp.vLead = float(self.v_ego)
 
-        # ??:????????(?? dt_for_log ????)
+        # 日志：记录更多诊断信息（使用 dt_for_log 保存的值）
         try:
             with open(self.log_path, "a") as f:
                 kf = self.kalman_filters.get(target_id, None)
@@ -510,7 +510,7 @@ class RadarInterface(RadarInterfaceBase):
         except Exception as e:
             print(f"[RadarInterface] log error: {e}")
 
-        # ??:????????????(? invalid_count ???????)
+        # 清理：删除长时间未更新的滤波器（按 invalid_count 和时间共同判断）
         to_del = []
         for tid, kf in list(self.kalman_filters.items()):
             age = current_ts - kf.last_time
