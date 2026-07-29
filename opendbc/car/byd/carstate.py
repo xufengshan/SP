@@ -7,9 +7,8 @@ import numpy as np
 #from openpilot.common.time_helpers import system_time_valid
 #from openpilot.common.swaglog import cloudlog
 
-#from opendbc.can.can_define import CANDefine
-#from opendbc.can.parser import CANParser
-from opendbc.can import CANDefine, CANParser
+from opendbc.can.can_define import CANDefine
+from opendbc.can.parser import CANParser
 
 from opendbc.car.common.conversions import Conversions as CV
 #from opendbc.car.common.numpy_fast import mean
@@ -70,7 +69,6 @@ class CarState(CarStateBase):
         self.prev_steeringAngleDeg = 0
         #self.steeringRate = 0.0
         self.steeringRateDegAbs = 0
-        self.esp_lkas_CruiseActivated = False
 
 
 
@@ -81,7 +79,6 @@ class CarState(CarStateBase):
         ret = structs.CarState()
 
         self.lkas_prepared = cp.vl["ACC_EPS_STATE"]["LKAS_Prepared"]
-        self.esp_lkas_CruiseActivated = cp.vl["ACC_EPS_STATE"]["CruiseActivated"]
 
         self.mpc_lkas_config = int(cp_cam.vl["ACC_MPC_STATE"]["LKAS_Config"])
         lkas_config_isAccOn = (self.mpc_lkas_config != LKASConfig.DISABLE)
@@ -150,11 +147,10 @@ class CarState(CarStateBase):
 
         ret.steeringTorque = cp.vl["ACC_EPS_STATE"]["SteerDriverTorque"]
         ret.steeringTorqueEps = cp.vl["ACC_EPS_STATE"]["MainTorque"]
-        #self.eps_warning = bool(cp.vl["ACC_EPS_STATE"]["SteerWarning"]) #Todo: some firmware have SteerWarning field asserted.
-        self.eps_warning = bool(cp.vl["ACC_EPS_STATE"]["LKAS_Prepared"]) and bool(cp.vl["ACC_EPS_STATE"]["CruiseActivated"]) 
+        self.eps_warning = bool(cp.vl["ACC_EPS_STATE"]["SteerWarning"]) #Todo: some firmware have SteerWarning field asserted.
         self.eps_state_counter = int(cp.vl["ACC_EPS_STATE"]["Counter"])
 
-        ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > 48, 3)
+        ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > 59, 5)
 
         ret.parkingBrake = (cp.vl["EPB"]["EPB_ActiveFlag"] == 1)
 
@@ -176,7 +172,6 @@ class CarState(CarStateBase):
         ret.latEnabled = self.lkas_isMainSwOn and self.lkas_allowed_speed
         #Todo: some firmware have these fields asserted.
         ret.steerFaultTemporary = bool((self.acc_state == 7) or self.eps_warning)
-        #ret.steerFaultTemporary = bool(self.acc_state == 7)
 
         self.acc_active_last = ret.cruiseState.enabled
 
@@ -199,7 +194,7 @@ class CarState(CarStateBase):
             if mrr_id == 2: #1:left, 2:front, 3:right
                 if bool(cp_cam.vl["RADAR_MRR"]["IsValid"]):
                     raw_dist = int(cp_cam.vl["RADAR_MRR"]["LongDist"])
-                    # ??????,?????????
+                    # 增加距离滤波，避免异常值导致误判
                     if 3 < raw_dist < 200:
                         self.mrr_leading_dist = raw_dist
                 else:
