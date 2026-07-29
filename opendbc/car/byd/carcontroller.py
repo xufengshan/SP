@@ -45,7 +45,7 @@ class CarController(CarControllerBase):
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
-    # ?????? - ??????
+    # 横向控制部分 - 保持原有逻辑
     if (self.frame - self.last_steer_frame) >= CarControllerParams.STEER_STEP:
       if self.first_start:
         self.mpc_lkas_counter = int(CS.acc_mpc_state_counter + 1) & 0xF
@@ -124,12 +124,12 @@ class CarController(CarControllerBase):
           self.apply_torque_last, self.lkas_req_prepare, self.lkas_active, CC.hudControl, self.mpc_lkas_counter))
 
       can_sends.append(bydcan.create_fake_318(self.packer, self.CP, CS.esc_eps,
-                                              CS.mpc_laks_output, CS.mpc_laks_reqprepare, CS.esp_lkas_CruiseActivated,
+                                              CS.mpc_laks_output, CS.mpc_laks_reqprepare, CS.mpc_laks_active,
                                               True, self.eps_fake318_counter))
 
-    # ?????? - ??MPC??,??????
+    # 纵向控制部分 - 信任MPC输出，只做安全限制
     if (self.frame + 1 - self.last_acc_frame) >= CarControllerParams.ACC_STEP:
-      # ??????
+      # 更新雷达数据
       self.sm.update(0)
 
       mpc_target_accel = CC.actuators.accel
@@ -139,11 +139,11 @@ class CarController(CarControllerBase):
         starting = CC.actuators.longControlState == LongCtrlState.starting
         running = CC.actuators.longControlState == LongCtrlState.pid
 
-        # ????????????(???????)
+        # 获取基本数据用于日志记录（不用于控制逻辑）
         lead_distance = getattr(CS, 'mrr_leading_dist', 199)
         v_ego = CS.out.vEgo
 
-        # ????????????
+        # 获取雷达融合数据用于日志
         lead_speed = 0.0
         relative_speed = 0.0
         fusion_distance = 199
@@ -159,18 +159,18 @@ class CarController(CarControllerBase):
             else:
                 data_source = "no_lead"
 
-        # ??????????????
-        # ??MPC???,????????????
+        # 车辆特定的安全限制和平滑处理
+        # 信任MPC的计算，只对极端情况进行安全限制
         if mpc_target_accel < 0:
-            # ?????????????
+            # 基于融合数据的动态制动缩放
             if fusion_distance < 199:
-                # ????:??????????
+                # 距离因子：针对快速接近场景优化
                 if relative_speed < -2.0 and fusion_distance < v_ego * 1.5:
-                    # ?????,??????
-                    distance_factor = 1.0  # ?????
-                    speed_factor = 1.2     # ????
+                    # 快速接近时，增强制动响应
+                    distance_factor = 1.0  # 不缩放制动
+                    speed_factor = 1.2     # 增强制动
                 else:
-                    # ???????
+                    # 正常情况的缩放
                     distance_factor = np.interp(fusion_distance, [5.0, 30.0], [0.8, 0.4])
                     if relative_speed < -1.0:
                         speed_factor = 1.0
@@ -179,29 +179,29 @@ class CarController(CarControllerBase):
                     else:
                         speed_factor = 0.5
 
-                # ????:??????(????),??????
-                if relative_speed < -1.0:  # ??????
+                # 速度因子：相对速度越大（接近前车），制动缩放越大
+                if relative_speed < -1.0:  # 快速接近前车
                     speed_factor = 1.0
-                elif relative_speed < 0:   # ??????
+                elif relative_speed < 0:   # 缓慢接近前车
                     speed_factor = 0.7
-                else:                      # ?????????
+                else:                      # 远离前车或速度匹配
                     speed_factor = 0.5
 
-                # ??????
+                # 综合缩放因子
                 brake_scale = distance_factor * speed_factor
                 brake_scale = np.clip(brake_scale, 0.3, 0.8)
             else:
-                # ??????????
+                # 无前车时大幅减少制动
                 brake_scale = 0.3
 
             scaled_accel = mpc_target_accel * brake_scale
         else:
-            # ????????
+            # 加速指令直接使用
             scaled_accel = mpc_target_accel
 
-        # ???? - ???????
+        # 平滑处理 - 防止加速度突变
         if hasattr(self, 'last_final_accel'):
-            # ??MPC?????
+            # 检测MPC的极端跳跃
             if hasattr(self, 'last_mpc_accel'):
                 mpc_change = abs(mpc_target_accel - self.last_mpc_accel)
                 accel_change_limit = 0.1 if mpc_change > 2.0 else 0.2
@@ -213,10 +213,10 @@ class CarController(CarControllerBase):
                 scaled_accel = self.last_final_accel + np.sign(accel_diff) * accel_change_limit
 
         self.last_mpc_accel = mpc_target_accel
-        final_accel = np.clip(scaled_accel, -2.5, 1.0)  # ????????
+        final_accel = np.clip(scaled_accel, -2.5, 1.0)  # 合理的加速度限制
         self.last_final_accel = final_accel
 
-        # ??????
+        # 停车状态逻辑
         if stopping and final_accel < -0.1:
           self.rfss = 0
           self.sss = CS.out.standstill
@@ -239,7 +239,7 @@ class CarController(CarControllerBase):
 
       self.mpc_acc_counter = int(self.mpc_acc_counter + 1) & 0xF
 
-      # ??????
+      # 发送控制命令
       can_sends.append(bydcan.acc_cmd(self.packer, self.CP, CS.cam_acc,
                                      getattr(CS, 'mrr_leading_dist', 199),
                                      final_accel, self.rfss, self.sss, CC.longActive,))
