@@ -93,7 +93,7 @@ def acc_cmd(packer, CP, cam_msg: dict, mrr_leaddist, accel, rfss, sss, longActiv
         jerk_upper = jerk_base_upper + accel * CarControllerParams.K_accel_jerk_upper
         jerk_lower = jerk_base_lower
 
-    if longActive and mrr_leaddist > 3:  # ????????
+    if longActive and mrr_leaddist > 3:  # 增加最小距离检查
         values.update({
             "AccelCmd" : accel,
             "ComfortBandUpper" : 0.05 if mrr_leaddist > 50 else 0.10,
@@ -107,7 +107,6 @@ def acc_cmd(packer, CP, cam_msg: dict, mrr_leaddist, accel, rfss, sss, longActiv
     data = packer.make_can_msg("ACC_CMD", CanBus.ESC, values)[1]
     values["CheckSum"] = byd_checksum(0xAF, data)
     return packer.make_can_msg("ACC_CMD", CanBus.ESC, values)
-    
 
 # send fake torque feedback from eps to trick MPC, preventing DTC, so that safety features such as AEB still working
 def create_fake_318(packer, CP, esc_msg: dict, faketorque, laks_reqprepare, laks_active , enabled, counter):
@@ -134,21 +133,21 @@ def create_fake_318(packer, CP, esc_msg: dict, faketorque, laks_reqprepare, laks
     if enabled :
         if laks_active:
             values.update({
-               # "LKAS_Prepared" : 0,
-               # "CruiseActivated" : 1,
-               #"MainTorque" : faketorque,
+                "LKAS_Prepared" : 0,
+                "CruiseActivated" : 1,
+                "MainTorque" : faketorque,
             })
         elif laks_reqprepare:
             values.update({
-                #"LKAS_Prepared" : 1,
-                #"CruiseActivated" : 0,
-                #"MainTorque" : 0,
+                "LKAS_Prepared" : 1,
+                "CruiseActivated" : 0,
+                "MainTorque" : 0,
             })
         else:
             values.update({
-                #"LKAS_Prepared" : 0,
-                #"CruiseActivated" : 0,
-                #"MainTorque" : 0,
+                "LKAS_Prepared" : 0,
+                "CruiseActivated" : 0,
+                "MainTorque" : 0,
             })
 
 
