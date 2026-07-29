@@ -18,7 +18,6 @@ NetworkLocation = structs.CarParams.NetworkLocation
 NON_LINEAR_TORQUE_PARAMS = {
   CAR.BYD_HAN_DM_20: [1.807, 1.674, 0.04],
   CAR.BYD_HAN_EV_20: [1.807, 1.674, 0.04],
-  CAR.BYD_TANG_DM: [1.807, 1.674, 0.04],
   CAR.BYD_SONG_PLUS_DMI_21: [1.807, 1.674, 0.04]
 }
 
@@ -58,7 +57,7 @@ class CarInterface(CarInterfaceBase):
             return self.torque_from_lateral_accel_linear
 
     @staticmethod
-    def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, experimental_long, is_release, docs) -> structs.CarParams: # type: ignore
+    def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, experimental_long, docs) -> structs.CarParams: # type: ignore
         ret.brand = "byd"
         ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.byd)]
 
