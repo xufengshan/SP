@@ -8,9 +8,9 @@ from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
 Ecu = CarParams.Ecu
 
 class CarControllerParams:
-  STEER_MAX = 280
-  STEER_DELTA_UP = 6
-  STEER_DELTA_DOWN = 9
+  STEER_MAX = 300
+  STEER_DELTA_UP = 7
+  STEER_DELTA_DOWN = 10
 
   STEER_DRIVER_ALLOWANCE = 68
   STEER_DRIVER_MULTIPLIER = 3
@@ -73,7 +73,7 @@ class CAR(Platforms):
 
   BYD_TANG_DM = BydPlatformConfig(
     [BydCarDocs("BYD TANG DM")],
-    CarSpecs(mass=2250., wheelbase=2.820, steerRatio=15.2, centerToFrontRatio=0.44, tireStiffnessFactor=1.0),
+    CarSpecs(mass=2250., wheelbase=2.820, steerRatio=15.0, centerToFrontRatio=0.44, tireStiffnessFactor=1.0),
   )
 
   BYD_TANG_DMI_21 = BydPlatformConfig(
